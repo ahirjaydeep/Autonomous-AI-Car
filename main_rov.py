@@ -14,7 +14,7 @@ STREAM_URL = f"http://{PHONE_IP}:8080/shot.jpg"
 
 BASE_SPEED = 180  # Speed of the car (0 to 255)
 
-# Initialize the AI Brain
+#  the AI Brain
 ai_brain = ZenityBrain()
 decoder = K.ImageDecoder()
 
