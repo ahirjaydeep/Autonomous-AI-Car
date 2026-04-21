@@ -1,36 +1,27 @@
 """
 ================================================================================
  ZENITY ROV — main_rov.py  |  "The Nervous System"
- Version: 2.0 (Production-Grade)
+ Version: 3.0 (Production-Grade — Refined)
 ================================================================================
  Responsibilities:
    - Camera thread: aggressive pull from IP Webcam /shot.jpg  (no buffer bloat)
    - UDP command socket: fires L,R PWM strings to ESP32 at ≤10 ms overhead
-   - Heartbeat thread: sends a keep-alive every 500 ms; ESP32 can E-STOP if
-     it goes silent (implement a watchdog timer on the C++ side)
+   - Heartbeat thread: sends keep-alive every 500 ms; ESP32 E-STOPs if silent
    - Drive state machine: DRIVE → STOP → RESUME  (debounced, clean transitions)
-   - Graceful shutdown: sends STOP command before Python exits
+   - LOST state: recovers from total lane loss by slowing + searching
+   - FPS counter and latency stats on HUD
+   - Graceful shutdown: sends STOP before Python exits
 
  UDP Packet format (UTF-8):
-   Normal drive →  "180,150\n"
-   Full stop    →  "0,0\n"
-   Heartbeat    →  "PING\n"
+   Normal drive  →  "180,150\n"
+   Full stop     →  "0,0\n"
+   Heartbeat     →  "PING\n"
 
- ESP32 C++ snippet (for reference):
-   void loop() {
-     int len = udp.parsePacket();
-     if (len) {
-       char buf[32]; udp.read(buf, len); buf[len] = 0;
-       if (strcmp(buf, "PING\n") == 0) { lastPing = millis(); return; }
-       int l, r; sscanf(buf, "%d,%d", &l, &r);
-       analogWrite(MOTOR_L, l); analogWrite(MOTOR_R, r);
-       lastPing = millis();
-     }
-     // Watchdog: if no packet for 1 s, E-STOP
-     if (millis() - lastPing > 1000) { analogWrite(MOTOR_L, 0); analogWrite(MOTOR_R, 0); }
-   }
+ ESP32 C++ watchdog snippet:
+   if (millis() - lastPing > 1000) { motor_L(0); motor_R(0); }
 ================================================================================
 """
+
 
 import cv2
 import time
@@ -41,6 +32,7 @@ import requests
 import numpy as np
 import signal
 import sys
+from collections import deque
 
 try:
     import kornia_rs as K
@@ -48,135 +40,157 @@ try:
     _USE_KORNIA = True
 except ImportError:
     _USE_KORNIA = False
-    print("[main] kornia_rs not found — falling back to cv2.imdecode")
+    print("[main] kornia_rs not found — using cv2.imdecode")
 
-from ai_engine5 import ZenityBrain
-
-
-
-# CONFIGURATION
+from ai_engine6 import ZenityBrain
 
 
-PHONE_IP    = "10.48.167.163"      # IP Webcam phone
-ESP32_IP    = "10.48.167.62"       # Fill in after flashing ESP32
-ESP32_PORT  = 4210                # UDP port — match with C++ code
+# ▌ CONFIGURATION  ← only file you should need to edit between runs
 
-STREAM_URL  = f"http://{PHONE_IP}:8080/shot.jpg"
+PHONE_IP   = "10.48.167.163"   
+ESP32_IP   = "10.48.167.62"    
+ESP32_PORT = 4210              
 
-BASE_SPEED          = 90   # 0-255 — overall drive speed
-MAX_STOP_DURATION   = 3.0   # seconds to hold brake after stop detected
-COMMAND_HZ          = 10    # max motor commands per second  (100 ms gate)
-HEARTBEAT_HZ        = 2     # keep-alive pings per second to ESP32
+STREAM_URL = f"http://{PHONE_IP}:8080/shot.jpg"
 
+# ── Speed constants (0–255) 
+BASE_SPEED          = 90   
+SLOW_SPEED          = 55    
+TURN_POWER          = 110   
 
-# DRIVE STATE MACHINE
+# ── Behaviour timings 
+MAX_STOP_DURATION   = 3.0   
+LOST_CRAWL_TIMEOUT  = 2.0   
+COMMAND_HZ          = 10    
+HEARTBEAT_HZ        = 2     
+CAMERA_TIMEOUT_S    = 2.0   
 
+# ── Steering sensitivity 
+STEER_DIVISOR       = 15.0  
+
+# ▌ DRIVE STATE MACHINE
 
 class DriveState:
-    DRIVE  = "DRIVE"
-    STOP   = "STOP"
+    DRIVE = "DRIVE"   
+    STOP  = "STOP"    
+    LOST  = "LOST"    
+
 
 class StateMachine:
-    """
-    Converts raw per-frame AI outputs into clean, debounced motor commands.
-
-    Transitions:
-      DRIVE  →  STOP   : stop_detected == True
-      STOP   →  DRIVE  : stop has been held for MAX_STOP_DURATION seconds
-    """
 
     def __init__(self):
-        self.state      = DriveState.DRIVE
-        self._stop_ts   = None           # timestamp we entered STOP
+        self.state       = DriveState.DRIVE
+        self._stop_ts    = None
+        self._lost_ts    = None
 
-    def update(self, stop_detected: bool, steering: float | None):
-        """
-        Returns (left_pwm, right_pwm) based on current state.
-        """
+    def update(self, stop_detected: bool, steering):
+        now = time.time()
+
+        # ── DRIVE ─────────────────────────────────────────────────────────────
         if self.state == DriveState.DRIVE:
             if stop_detected:
-                self.state    = DriveState.STOP
-                self._stop_ts = time.time()
+                self._enter_stop(now)
                 return 0, 0
 
             if steering is None:
-                # Lane lost — go straight and hope for the best
-                return BASE_SPEED, BASE_SPEED
+                # First frame of lane loss — start the lost timer
+                if self._lost_ts is None:
+                    self._lost_ts = now
 
-            left, right = _steering_to_tank(steering)
+                elapsed_lost = now - self._lost_ts
+                if elapsed_lost > LOST_CRAWL_TIMEOUT:
+                    print(f"[StateMachine] {elapsed_lost:.1f}s lane loss → LOST state")
+                    self.state = DriveState.LOST
+                    return 0, 0
+
+                # Still within grace period — crawl straight
+                return SLOW_SPEED, SLOW_SPEED
+
+            # Normal: lane acquired
+            self._lost_ts = None
+            left, right   = _steering_to_tank(steering)
             return left, right
 
+        # ── STOP 
         elif self.state == DriveState.STOP:
-            elapsed = time.time() - self._stop_ts
+            elapsed = now - self._stop_ts
             if elapsed >= MAX_STOP_DURATION:
-                print(f"[StateMachine] Stop held for {elapsed:.1f}s → resuming DRIVE")
-                self.state = DriveState.DRIVE
+                print(f"[StateMachine] Stop held {elapsed:.1f}s → DRIVE")
+                self.state    = DriveState.DRIVE
+                self._lost_ts = None
             return 0, 0
 
-        return 0, 0   # fallback safety
+        # ── LOST 
+        elif self.state == DriveState.LOST:
+            if stop_detected:
+                self._enter_stop(now)
+                return 0, 0
+            if steering is not None:
+                print("[StateMachine] Lane reacquired → DRIVE")
+                self.state    = DriveState.DRIVE
+                self._lost_ts = None
+                left, right   = _steering_to_tank(steering)
+                return left, right
+            # Still lost — full stop (safer than crawling blind)
+            return 0, 0
+
+        return 0, 0   # unreachable safety net
+
+    def _enter_stop(self, ts: float):
+        self.state    = DriveState.STOP
+        self._stop_ts = ts
+        print("[StateMachine] STOP triggered")
 
 
-
-# HELPERS
-
+# ▌ HELPERS
 
 def _steering_to_tank(steering_deg: float):
     """
-    Maps a PID steering angle to differential (tank) drive PWM values.
-    Upgraded for 4WD Skid-Steering at low base speeds.
+    Maps signed PID steering angle → differential (tank / skid-steer) PWM.
+
+      steering_deg > 0 → turn RIGHT  → right motor slower (or reverse)
+      steering_deg < 0 → turn LEFT   → left motor slower (or reverse)
+
+    Allowing negative values means the inner wheel spins backwards on sharp
+    turns, giving a true pivot — essential for a 4WD skid-steer chassis.
     """
-    # 1. Sensitivity limit (lower divisor = sharper steering response)
-    t = max(-1.0, min(1.0, steering_deg / 15.0))
-    
-    # 2. Turn Power Factor 
-    # This guarantees enough torque to skid the tires even if BASE_SPEED is 90
-    TURN_POWER = 110
-    
-    # 3. Additive Mixing 
-    # (Note: If the car turns the wrong way again, just swap the + and - signs below)
-    left  = int(BASE_SPEED + (t * TURN_POWER))
-    right = int(BASE_SPEED - (t * TURN_POWER))
-    
-    # 4. Clamp to -255 and 255. 
-    # Allowing negative numbers means the inner wheels will physically spin 
-    # backwards on sharp turns, forcing the car to pivot!
-    return max(-255, min(255, left)), max(-255, min(255, right))
+    t     = max(-1.0, min(1.0, steering_deg / STEER_DIVISOR))
+    left  = int(BASE_SPEED + t * TURN_POWER)
+    right = int(BASE_SPEED - t * TURN_POWER)
+    return (max(-255, min(255, left)),
+            max(-255, min(255, right)))
 
 
 def _send_udp(sock: socket.socket, addr: tuple, payload: str):
-    """Fire-and-forget UDP send.  Never blocks the main loop."""
+    """Non-blocking fire-and-forget UDP. Silently absorbs network errors."""
     try:
         sock.sendto(payload.encode(), addr)
     except OSError:
         pass
 
 
-
-# CAMERA THREAD
-
+# ▌ CAMERA THREAD
 
 def camera_thread(q: queue.Queue, stop_event: threading.Event):
     """
-    Pulls /shot.jpg from the phone in a tight loop.
-    Only keeps the NEWEST frame — old frames are discarded immediately.
-    Uses kornia_rs Rust decoder if available (faster), otherwise cv2.imdecode.
+    Pulls /shot.jpg in a tight loop, always dropping stale frames.
+    Uses kornia_rs Rust decoder if available, otherwise cv2.imdecode.
+    Exponential back-off on failure (caps at 1 s).
     """
     session = requests.Session()
     session.headers.update({"Connection": "keep-alive"})
-
-    decoder = K.ImageDecoder() if _USE_KORNIA else None
-    backoff = 0.05   # seconds to wait after a failure (exponential up to 1 s)
+    decoder = (K.ImageDecoder() if _USE_KORNIA else None)
+    backoff = 0.05
 
     while not stop_event.is_set():
         try:
             resp = session.get(STREAM_URL, timeout=1.5)
             resp.raise_for_status()
 
-            # ── Decode 
             if _USE_KORNIA and decoder is not None:
-                decoded  = decoder.decode(resp.content)
-                img_rgb  = torch.from_dlpack(decoded).numpy()
-                img_bgr  = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                decoded = decoder.decode(resp.content)
+                img_bgr = cv2.cvtColor(
+                    torch.from_dlpack(decoded).numpy(), cv2.COLOR_RGB2BGR)
             else:
                 arr     = np.frombuffer(resp.content, dtype=np.uint8)
                 img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -184,30 +198,27 @@ def camera_thread(q: queue.Queue, stop_event: threading.Event):
             if img_bgr is None:
                 raise ValueError("Decoded frame is None")
 
-            # ── Drop stale frames — only ever hold 1 
+            # Always hold only the newest frame
             if q.full():
                 try:
                     q.get_nowait()
                 except queue.Empty:
                     pass
             q.put(img_bgr)
-
-            backoff = 0.05   # reset backoff on success
+            backoff = 0.05
 
         except Exception as exc:
-            print(f"[Camera] Error: {exc}  — retry in {backoff:.2f}s")
+            print(f"[Camera] {exc}  — retry in {backoff:.2f}s")
             time.sleep(backoff)
-            backoff = min(backoff * 2, 1.0)   # cap at 1 second
+            backoff = min(backoff * 2, 1.0)
 
 
-
-# HEARTBEAT THREAD
-
+# ▌ HEARTBEAT THREAD
 
 def heartbeat_thread(sock: socket.socket, addr: tuple, stop_event: threading.Event):
     """
-    Sends "PING\\n" to the ESP32 at HEARTBEAT_HZ.
-    If this thread goes silent (Python crash), the ESP32 watchdog will E-STOP.
+    Sends "PING\\n" to ESP32 at HEARTBEAT_HZ.
+    If Python crashes, this thread dies → ESP32 watchdog fires E-STOP.
     """
     interval = 1.0 / HEARTBEAT_HZ
     while not stop_event.is_set():
@@ -215,31 +226,102 @@ def heartbeat_thread(sock: socket.socket, addr: tuple, stop_event: threading.Eve
         time.sleep(interval)
 
 
+# ▌ FPS / LATENCY TRACKER
 
-# MAIN LOOP
+class PerfTracker:
+    """Rolling window FPS and average AI latency display."""
 
+    def __init__(self, window: int = 30):
+        self._times: deque = deque(maxlen=window)
+        self._latencies: deque = deque(maxlen=window)
+
+    def tick(self, latency_ms: float):
+        self._times.append(time.perf_counter())
+        self._latencies.append(latency_ms)
+
+    @property
+    def fps(self) -> float:
+        if len(self._times) < 2:
+            return 0.0
+        return (len(self._times) - 1) / (self._times[-1] - self._times[0] + 1e-9)
+
+    @property
+    def avg_latency(self) -> float:
+        return sum(self._latencies) / max(len(self._latencies), 1)
+
+
+# ▌ HUD OVERLAY
+
+# State → (label_text, BGR_color)
+_STATE_STYLE = {
+    DriveState.DRIVE: ("DRIVE",  (0, 220, 0)),
+    DriveState.STOP:  ("STOP",   (0, 0, 255)),
+    DriveState.LOST:  ("LOST",   (0, 165, 255)),
+}
+
+
+def _draw_hud(display, state, left, right, steering, latency_ms, fps):
+    h, w  = display.shape[:2]
+    font  = cv2.FONT_HERSHEY_SIMPLEX
+
+    # ── Top banner 
+    overlay = display.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 48), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, display, 0.45, 0, display)
+
+    label, color = _STATE_STYLE.get(state, ("???", (200, 200, 200)))
+    cv2.putText(display, f"[{label}]", (8, 32), font, 0.85, color, 2)
+
+    cv2.putText(display, f"L:{left:+4d}  R:{right:+4d}",
+                (170, 32), font, 0.72, (255, 255, 255), 2)
+
+    steer_str = f"Steer:{steering:+6.1f}d" if steering is not None else "Steer:  LOST"
+    steer_col = (200, 200, 255) if steering is not None else (0, 100, 255)
+    cv2.putText(display, steer_str, (420, 32), font, 0.68, steer_col, 2)
+
+    # ── Bottom-right: perf stats 
+    cv2.putText(display, f"{fps:.1f} FPS  {latency_ms:.1f}ms",
+                (w - 220, h - 10), font, 0.6, (100, 255, 100), 1)
+
+    # ── Steering bar (visual gauge) 
+    bar_cx = w // 2
+    bar_y  = h - 18
+    bar_hw = 80   # half-width of the bar
+    cv2.rectangle(display, (bar_cx - bar_hw, bar_y - 6),
+                  (bar_cx + bar_hw, bar_y + 6), (50, 50, 50), -1)
+
+    if steering is not None:
+        indicator_x = int(bar_cx + np.clip(steering / 35.0, -1.0, 1.0) * bar_hw)
+        bar_color   = (0, 200, 255) if abs(steering) < 15 else (0, 80, 255)
+        cv2.rectangle(display, (bar_cx, bar_y - 6),
+                      (indicator_x, bar_y + 6), bar_color, -1)
+
+    cv2.line(display, (bar_cx, bar_y - 10), (bar_cx, bar_y + 10), (200, 200, 200), 1)
+
+
+# ▌ MAIN LOOP
 
 def main():
-    print("=" * 60)
-    print("  ZENITY ROV  |  v2.0  |  Initialising…")
-    print("=" * 60)
+    print("=" * 62)
+    print("  ZENITY ROV  |  v3.0  |  Initialising…")
+    print("=" * 62)
 
-    # ── Subsystems 
-    ai_brain    = ZenityBrain()
+    ai_brain      = ZenityBrain()
     state_machine = StateMachine()
-    stop_event  = threading.Event()
+    perf          = PerfTracker()
+    stop_event    = threading.Event()
 
-    # ── UDP socket (shared by main loop + heartbeat thread)
     esp_addr = (ESP32_IP, ESP32_PORT)
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setblocking(False)
 
-    # ── Graceful shutdown handler
+    # ── Graceful shutdown 
     def _shutdown(sig=None, frame=None):
-        print("\n[main] Shutdown signal received — sending STOP to ESP32…")
+        print("\n[main] Shutdown — sending STOP to ESP32 …")
         stop_event.set()
-        _send_udp(udp_sock, esp_addr, "0,0\n")   # motors off
-        time.sleep(0.2)
+        for _ in range(3):                      # send 3× for reliability
+            _send_udp(udp_sock, esp_addr, "0,0\n")
+            time.sleep(0.05)
         udp_sock.close()
         cv2.destroyAllWindows()
         print("[main] Clean exit.")
@@ -250,95 +332,79 @@ def main():
 
     # ── Threads 
     frame_queue = queue.Queue(maxsize=2)
-
     t_cam = threading.Thread(
-        target=camera_thread, args=(frame_queue, stop_event), daemon=True
+        target=camera_thread,
+        args=(frame_queue, stop_event),
+        daemon=True,
     )
     t_hb = threading.Thread(
-        target=heartbeat_thread, args=(udp_sock, esp_addr, stop_event), daemon=True
+        target=heartbeat_thread,
+        args=(udp_sock, esp_addr, stop_event),
+        daemon=True,
     )
     t_cam.start()
     t_hb.start()
+    print("[main] Camera + heartbeat threads started — waiting for first frame …\n")
 
-    print("[main] Camera + heartbeat threads started. Waiting for first frame…")
-
-    last_cmd_time  = 0.0
-    cmd_interval   = 1.0 / COMMAND_HZ
-    frame_count    = 0
+    last_cmd_time = 0.0
+    cmd_interval  = 1.0 / COMMAND_HZ
+    frame_count   = 0
+    left_pwm      = 0
+    right_pwm     = 0
 
     while not stop_event.is_set():
-        # ── Frame acquisition
+
+        # ── Frame acquisition 
         try:
-            frame = frame_queue.get(timeout=2.0)
+            frame = frame_queue.get(timeout=CAMERA_TIMEOUT_S)
         except queue.Empty:
-            print("[main] ⚠  No frame in 2 s — camera feed down?")
+            print("[main] ⚠  No frame — camera down?")
+            _send_udp(udp_sock, esp_addr, "0,0\n")   # safe default
             continue
 
         t0 = time.perf_counter()
 
         # ── AI inference 
         display, steering, stop_detected = ai_brain.process_frame(frame)
-
         ai_ms = (time.perf_counter() - t0) * 1000
 
         if display is None:
             continue
 
-        # ── State machine → motor command 
+        # ── State machine → PWM 
         left_pwm, right_pwm = state_machine.update(stop_detected, steering)
 
         # ── Rate-limited UDP send 
         now = time.perf_counter()
         if now - last_cmd_time >= cmd_interval:
             last_cmd_time = now
-            payload = f"{left_pwm},{right_pwm}\n"
-            _send_udp(udp_sock, esp_addr, payload)
+            _send_udp(udp_sock, esp_addr, f"{left_pwm},{right_pwm}\n")
 
-            # Console log (only every 10th frame to avoid spam)
             frame_count += 1
             if frame_count % 10 == 0:
-                state_label = "🛑 STOP" if state_machine.state == DriveState.STOP else "✅ DRIVE"
-                steer_label = f"{steering:+.1f}°" if steering is not None else "N/A"
+                state_str = state_machine.state
+                steer_str = f"{steering:+.1f}°" if steering is not None else "N/A"
                 print(
-                    f"[{state_label}]  L:{left_pwm:3d}  R:{right_pwm:3d}"
-                    f"  steer:{steer_label}  AI:{ai_ms:.1f}ms"
+                    f"[{state_str:<5}]  L:{left_pwm:+4d}  R:{right_pwm:+4d}"
+                    f"  steer:{steer_str:>8}  AI:{ai_ms:5.1f}ms"
+                    f"  FPS:{perf.fps:4.1f}"
                 )
 
-        # ── Dashboard overlay
-        total_ms = (time.perf_counter() - t0) * 1000
+        # ── Dashboard 
+        perf.tick(ai_ms)
+        _draw_hud(display, state_machine.state,
+                  left_pwm, right_pwm, steering, ai_ms, perf.fps)
 
-        _draw_hud(display, state_machine.state, left_pwm, right_pwm, steering, total_ms)
-
-        cv2.imshow("Zenity ROV Dashboard", display)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        cv2.imshow("Zenity ROV  —  v3.0", display)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
             break
+        elif key == ord(" "):
+            # Manual e-stop: press SPACE to immediately send 0,0
+            print("[main] Manual E-STOP via SPACE key")
+            _send_udp(udp_sock, esp_addr, "0,0\n")
 
     _shutdown()
-
-
-
-# HUD OVERLAY
-
-
-def _draw_hud(display, state, left, right, steering, latency_ms):
-    """Draws a clean informational overlay on the dashboard frame."""
-    h, w = display.shape[:2]
-    font  = cv2.FONT_HERSHEY_SIMPLEX
-
-    # Semi-transparent black banner at top
-    overlay = display.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 45), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.5, display, 0.5, 0, display)
-
-    state_color = (0, 0, 255) if state == DriveState.STOP else (0, 255, 0)
-    cv2.putText(display, f"STATE: {state}", (10, 30), font, 0.8, state_color, 2)
-    cv2.putText(display, f"L:{left:3d}  R:{right:3d}", (230, 30), font, 0.7, (255, 255, 255), 2)
-
-    steer_str = f"Steer: {steering:+.1f} deg" if steering is not None else "Steer: LOST"
-    cv2.putText(display, steer_str, (430, 30), font, 0.7, (200, 200, 255), 2)
-    cv2.putText(display, f"{latency_ms:.1f} ms", (w - 120, 30), font, 0.7, (100, 255, 100), 2)
-
-
 
 
 if __name__ == "__main__":
