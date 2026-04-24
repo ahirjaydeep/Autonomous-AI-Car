@@ -1,4 +1,4 @@
-<h1 align="center">🚗 Zenity ROV</h1>
+<h1 align="center">🚗 Autonomous-AI-Car</h1>
 
 <p align="center">
   <strong>A Production-Grade, Vision-Based Autonomous Vehicle<br/>with Hardware-Level Failsafes and Real-Time AI Perception</strong>
@@ -11,16 +11,18 @@
   <img src="https://img.shields.io/badge/Comms-UDP_Unicast-4B8BBE?style=for-the-badge" alt="UDP" />
   <img src="https://img.shields.io/badge/Vision-OpenCV_+_kornia--rs-5C3EE8?style=for-the-badge&logo=opencv&logoColor=white" alt="OpenCV" />
   <img src="https://img.shields.io/badge/Power-7.4V_Li--Ion-FF4500?style=for-the-badge" alt="7.4V" />
+  <img src="https://img.shields.io/badge/Pre--Print-Zenodo-1DA462?style=for-the-badge&logo=zenodo&logoColor=white" alt="Zenodo Pre-Print" />
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License" />
   <img src="https://img.shields.io/badge/Status-Under_Development-blue?style=flat-square" alt="Status" />
+  <a href="https://zenodo.org/records/19689462"><img src="https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19689462-blue?style=flat-square" alt="DOI" /></a>
 </p>
 
 ---
 
-> **Author's Note:** Zenity ROV is a solo-built autonomous vehicle that fuses custom-trained deep learning with real-time embedded control. Every line of Python AI code, every C++ failsafe, and every motor wire has been designed, written, and soldered by a single engineer. This README documents the full system — from neural network to wheel motor.
+> **Project Note:** Autonomous-AI-Car is a team-built autonomous vehicle that fuses custom-trained deep learning with real-time embedded control. The system — from neural network inference and UDP communications down to hardware wiring and MongoDB telemetry logging — was engineered collaboratively. A **pre-print research paper** covering the architecture and results has been published on Zenodo: [**zenodo.org/records/19689462**](https://zenodo.org/records/19689462).
 
 ---
 
@@ -45,12 +47,14 @@
 - [How to Run](#-how-to-run)
 - [Technical Deep Dives](#-technical-deep-dives)
 - [Roadmap](#-roadmap)
+- [Credits & Team](#-credits--team)
+- [Research Publication](#-research-publication)
 
 ---
 
 ## 🔭 The Concept
 
-Most hobbyist robot cars are remote-controlled toys wearing an "autonomous" label. Zenity ROV is different. It is a **genuine ADAS (Advanced Driver Assistance System) prototype** that processes live camera feeds through a custom-trained neural network, detects traffic signs, pedestrians, and lanes in real time, and calculates differential steering commands — all while an independent microcontroller stands guard with hardware-level failsafes that **cannot be overridden by software bugs**.
+Most hobbyist robot cars are remote-controlled toys wearing an "autonomous" label. Autonomous-AI-Car is different. It is a **genuine ADAS (Advanced Driver Assistance System) prototype** that processes live camera feeds through a custom-trained neural network, detects traffic signs, pedestrians, and lanes in real time, and calculates differential steering commands — all while an independent microcontroller stands guard with hardware-level failsafes that **cannot be overridden by software bugs**.
 
 The core design principle is **Brain/Spine separation**:
 
@@ -138,7 +142,7 @@ graph LR
 ### Wiring Guide — The L298N 4-Wire PWM Hack
 
 > [!IMPORTANT]
-> **This is not the standard L298N wiring.** The conventional approach uses `IN1`/`IN2` for direction (HIGH/LOW) and `ENA` for speed (PWM). Zenity uses a **simplified 4-wire method** that eliminates the direction pins entirely.
+> **This is not the standard L298N wiring.** The conventional approach uses `IN1`/`IN2` for direction (HIGH/LOW) and `ENA` for speed (PWM). Autonomous-AI-Car uses a **simplified 4-wire method** that eliminates the direction pins entirely.
 
 #### How It Works
 
@@ -157,7 +161,7 @@ The L298N's internal logic gate responds to the *voltage level* on IN pins. When
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    ZENITY ROV — WIRING MAP                      │
+│                AUTONOMOUS AI CAR — WIRING MAP                   │
 ├──────────────────┬──────────────────┬───────────────────────────┤
 │    ESP32 Pin     │   Connects To    │          Purpose          │
 ├──────────────────┼──────────────────┼───────────────────────────┤
@@ -376,36 +380,20 @@ In a single-processor system (e.g., Raspberry Pi doing both AI and motor control
 ## 📂 Project Structure
 
 ```
-zenity_rov/
-├── main_rov4.py          # 🎯 Production entry point — "The Nervous System"
-│                         #    Camera thread, UDP comms, heartbeat, state machine, HUD
-│
-├── ai_engine5.py         # 🧠 Production AI engine — "The Brain" (v3.0 Single-Model)
-│                         #    ZenityBrain class: YOLO11 + Lane Detection + PID
-│
-├── ai_engine4.py         # 🧠 Previous AI engine (v2.0) — dual-model architecture
-├── ai_engine3.py         # 📦 Archived — YOLO11 Nano speed-optimized variant
-├── ai_engine2.py         # 📦 Archived — first multi-class YOLO + dual-lane
-├── ai_engine.py          # 📦 Archived — first production engine with distance estimation
-│
-├── ai_brain3.py          # 🔬 Early prototype — session-based camera + FPS counter
-├── ai_brain2.py          # 🔬 Early prototype — /shot.jpg single-frame pull
-├── ai_brain.py           # 🔬 Early prototype — MJPEG stream parser
-│
-├── main_rov.py           # 📦 Archived — v1.0 entry point (HTTP-based motor control)
+Autonomous-AI-Car/
+├── archive/              # 📦 Archived iterations (older AI engines, brains, and ROV scripts)
 │
 ├── test/
+│   ├── test_ocr.py       # 🧪 EasyOCR speed-sign reading experiment
 │   ├── test_udp.py       # 🧪 Interactive UDP transmitter for motor testing
-│   ├── test_vision.py    # 🧪 kornia_rs camera feed validation
-│   └── test_ocr.py       # 🧪 EasyOCR speed-sign reading experiment
+│   └── test_vision.py    # 🧪 Camera feed validation tests
 │
-├── zenity_master.pt      # 🤖 Custom fine-tuned YOLO11 model (gitignored)
-├── venv/                 # 🐍 Python virtual environment
-└── .gitignore
+├── README.md             # 📖 Project documentation
+│
+├── ai_brain.py           # 🧠 AI vision pipeline (persistent sessions, FPS tracking)
+├── ai_engine.py          # ⚙️ Production AI engine (YOLO pipeline, Lane Detection)
+└── main_rov.py           # 🎯 Production entry point (State machine, communications)
 ```
-
-> [!TIP]
-> The numbered file versions (`ai_engine.py` → `ai_engine5.py`) represent the project's iterative engineering history — from simple MJPEG parsing to a production-grade dual-pipeline AI system. The current production files are **`main_rov4.py`** and **`ai_engine5.py`**.
 
 ---
 
@@ -417,8 +405,8 @@ zenity_rov/
 
 ```bash
 # Clone the repository
-git clone https://github.com/<your-username>/zenity_rov.git
-cd zenity_rov
+git clone https://github.com/ahirjaydeep/Autonomous-AI-Car.git
+cd Autonomous-AI-Car
 
 # Create and activate virtual environment
 python3 -m venv venv
@@ -507,7 +495,7 @@ python main_rov4.py
 You should see:
 ```
 ============================================================
-  ZENITY ROV  |  v2.0  |  Initialising…
+  AUTONOMOUS AI CAR  |  v2.0  |  Initialising…
 ============================================================
 [ZenityBrain] Loading zenity_master.pt …
 [ZenityBrain] Model pinned to → MPS
@@ -595,11 +583,37 @@ If both lane centroids are `None` (no valid contours found in either half), the 
 
 ---
 
+## 👥 Credits & Team
+
+Autonomous-AI-Car was built as a **collaborative team project** under the leadership of Jaydeep Ahir. Each member brought essential skills that made the system possible.
+
+| Role | Contributor | Contributions |
+|---|---|---|
+| **Project Lead & Full-Stack Engineer** | **Jaydeep Ahir** | Led the entire project end-to-end — AI/ML pipeline (YOLO11, lane detection, PID), software architecture (`main_rov4.py`, all `ai_engine` versions), ESP32 firmware, UDP communication protocol, system integration, and authored the published research paper. |
+| **Hardware Engineer & Data Infrastructure** | **Jihan Gajjar** | Co-built the physical vehicle chassis and hardware assembly; designed and implemented the **MongoDB telemetry log storage** system for data collection and replay. |
+| **Hardware Engineer & Wiring Specialist** | **Harshit Nakrani** | Co-built the hardware alongside Jihan Gajjar; responsible for the **wiring connections** (L298N motor driver, HC-SR04 sensor, power rail); contributed software suggestions during development. |
+
+---
+
+## 📄 Research Publication
+
+A **pre-print research paper** documenting the Autonomous-AI-Car system architecture, design decisions, experimental results, and hardware-software co-design principles has been published and is publicly accessible:
+
 <p align="center">
-  <strong>Designed, Engineered & Wired Solo by Jaydeep Ahir.</strong><br/>
-  <em>Zenity ROV — where neural networks meet real wheels.</em>
+  <a href="https://zenodo.org/records/19689462">
+    <img src="https://img.shields.io/badge/Read%20Pre--Print%20on%20Zenodo-1DA462?style=for-the-badge&logo=zenodo&logoColor=white" alt="Read on Zenodo" />
+  </a>
+</p>
+
+> **Citation:** J. Ahir, “Decoupled Perception-Actuation Architecture for Low-Cost Level 2 ADAS Prototyping Using YOLO and ESP32”, Zenodo, Apr. 2026. doi: 10.5281/zenodo.19689462. Zenodo. https://zenodo.org/records/19689462
+
+---
+
+<p align="center">
+  <strong>Engineered by the Autonomous-AI-Car Team — Jaydeep Ahir · Jihan Gajjar · Harshit Nakrani</strong><br/>
+  <em>Autonomous-AI-Car — where AI meets real wheels.</em>
 </p>
 
 <p align="center">
-  <sub>© 2025–2026 Jaydeep Ahir. Built with 🧠 and a soldering iron.</sub>
+  <sub>© 2025–2026 Jaydeep Ahir (@ahirjaydeep). Built with AI, a soldering iron, and great teamwork.</sub>
 </p>
