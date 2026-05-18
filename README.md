@@ -20,9 +20,13 @@
   <a href="https://zenodo.org/records/19689462"><img src="https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19689462-blue?style=flat-square" alt="DOI" /></a>
 </p>
 
+
+
 ---
 
 > **Project Note:** Autonomous-AI-Car is a team-built autonomous vehicle that fuses custom-trained deep learning with real-time embedded control. The system — from neural network inference and UDP communications down to hardware wiring and MongoDB telemetry logging — was engineered collaboratively. A **pre-print research paper** covering the architecture and results has been published on Zenodo: [**zenodo.org/records/19689462**](https://zenodo.org/records/19689462).
+>
+> 🎥 **Watch it in action:** [**Click here to view the demo videos and project media folder**](https://drive.google.com/drive/folders/1jqcsVGSfpBd6x191pNQ81Gw5HEixSyQ2?usp=sharing).
 
 ---
 
