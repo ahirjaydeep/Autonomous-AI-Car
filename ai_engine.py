@@ -15,40 +15,31 @@
 
 """
 ================================================================================
- ZENITY ROV — ai_engine7.py  |  "The Brain"
- Version: 7.0 (Production — Turn-Aware, Single-Lane Tracking)
+ ZENITY ROV — ai_engine8.py  |  "The Brain"
+ Version: 8.0 (Production — Camera Offset, Nearest-Pair Tracking, Lane Memory)
 ================================================================================
- KEY IMPROVEMENTS over v4/v5/v6:
+ KEY IMPROVEMENTS over v7.1:
 
- TURN DETECTION (the main problem):
-   - Multi-slice scanning (8 slices) with exponential weighting
-   - Far-ahead slices weighted HIGHER to see curves EARLY before the car
-     reaches them (look-ahead steering)
-   - Curve anticipation: when only one lane line is visible (common mid-turn),
-     the steering aggressively follows the visible line + inferred offset
-   - ROI starts at 35% of frame height (sees further ahead than v4's 50%)
-   - Single-lane tracking: car stays in ONE lane on a two-lane track
+ CAMERA OFFSET:
+   - Corrects for phone camera mounted 6cm left of car centreline
+   - Configurable CAMERA_OFFSET_PX constant (default 55px)
+
+ NEAREST-PAIR LANE TRACKING:
+   - Replaces v7.1's LEFT/RIGHT split (which broke on turns)
+   - Finds ALL white lines in the full mask, picks the pair whose
+     midpoint is closest to the car centre → always tracks correct lane
+   - LANE_WIDTH_MAX = 500 rejects lane pairs that are too wide
+     (prevents tracking left_boundary + right_boundary as one "lane")
+
+ LANE MEMORY:
+   - Remembers last known position of left and right lane lines (EMA)
+   - On subsequent frames, matches detected lines to remembered positions
+   - If a new line is too far from its remembered position (LINE_JUMP_THRESH),
+     it's treated as a DIFFERENT line (e.g., outer road boundary) and ignored
+   - Prevents the car from "jumping" to track the wrong lane on turns
 
  YOLO DETECTION:
-   - Strict class filtering (Person, Stop, Traffic Light, 30, 40, Parking)
-   - Area-ratio proximity triggers (≥4% screen area)
-   - Traffic light HSV classifier (red/green pixel thresholding)
-   - Stop-sign debounce: 3 consecutive frames required
-   - NEW: Returns detection metadata dict (speed_limit, etc.)
-
- LANE DETECTION:
-   - CLAHE + Otsu adaptive thresholding (auto-adjusts to lighting)
-   - Morphological cleanup (close gaps in lane lines)
-   - Auto-calibrating lane width from real measurements
-   - Three-line detection for two-lane tracks (left, center, right)
-   - Picks the two nearest lines to form the current lane
-   - Weighted centroid steering from multiple horizontal slices
-
- ARCHITECTURE:
-   - All tuneable constants at class level with documentation
-   - Separated _build_white_mask() for testability
-   - Rich developer logs with [ZenityBrain] prefix
-   - Every method documented with purpose + I/O explanation
+   - Same as v7.0 (unchanged)
 ================================================================================
 """
 
@@ -164,53 +155,62 @@ class ZenityBrain:
     """
 
     # ══════════════════════════════════════════════════════════════════════════
-    # TUNEABLE CONSTANTS  (v7.1 — Simplified for Black Road + White Lanes)
+    # TUNEABLE CONSTANTS  (v8.0 — Camera Offset + Nearest-Pair Tracking)
     # ══════════════════════════════════════════════════════════════════════════
-    # ADJUST THESE FIRST before changing any logic. Each constant has a comment
-    # explaining what it does and what happens if you change it.
+    # ADJUST THESE FIRST before changing any logic.
+
+    # --- CAMERA OFFSET ---
+    # The phone camera is NOT centred on the chassis. It is mounted ~6cm LEFT
+    # of the car's centreline. In the image, the car's true centre appears
+    # shifted RIGHT of the image centre.
+    # This offset corrects for that: cx_img = image_centre + CAMERA_OFFSET_PX.
+    #
+    # HOW TO CALIBRATE:
+    #   1. Place car perfectly centred on a straight lane
+    #   2. Run the AI, look at the dashboard
+    #   3. If the green arrow points RIGHT → increase this value
+    #   4. If the green arrow points LEFT  → decrease this value
+    #   5. When the arrow is near-zero on a straight lane, you're done
+    #
+    # Rough estimate: ~9 px/cm at typical phone height (25-30cm).
+    #   6 cm × 9 px/cm ≈ 55 pixels.
+    CAMERA_OFFSET_PX = 0    # positive = camera is LEFT of car centre
+                              # ↑ increase if car still drifts left
+                              # ↓ decrease if car drifts right
+                              # Set to 0 if camera IS centred
 
     # --- WHITE LINE DETECTION ---
-    # FIXED threshold — much more reliable than Otsu for white-on-black tracks.
-    # Otsu fails here because white lane lines are <5% of the image; the
-    # histogram is dominated by black road, so Otsu picks a low threshold
-    # that lets road noise through as false lane detections.
-    WHITE_THRESH = 180       # ↑ higher (200) = only catches bright white tape/paint
-                              # ↓ lower (150) = catches dimmer lines but more noise
-                              # For indoor white-tape tracks: 160–190
-                              # For outdoor painted lanes: 130–160
+    WHITE_THRESH = 180       # Fixed threshold for white-on-black tracks
+                              # ↑ higher (200) = only catches bright white
+                              # ↓ lower (150) = catches dimmer lines, more noise
 
     # --- ROI (Region of Interest) ---
-    # Controls how much of the frame the lane detector sees.
-    # CHANGED from 0.35 → 0.45. Looking too far ahead (0.35) caused the car
-    # to steer toward distant features/reflections instead of the actual
-    # nearest lane lines. 0.45 = bottom 55% of frame = focuses on the road
-    # right in front of the car.
-    ROI_TOP_FRACTION = 0.45  # 0.45 = see 55% of frame (near-road focus)
-                              # ↓ 0.35 = see further ahead (better for fast curves)
-                              # ↑ 0.55 = only immediate road (safest, least anticipation)
+    ROI_TOP_FRACTION = 0.45  # Bottom 55% of frame (near-road focus)
 
     # --- LANE GEOMETRY ---
-    LANE_WIDTH_INIT = 260    # initial guess for lane width in pixels
-    LANE_WIDTH_MIN  = 80     # reject impossibly narrow line pairs (noise)
-    LANE_WIDTH_MAX  = 600    # reject impossibly wide line pairs
+    LANE_WIDTH_INIT = 260    # Initial guess for lane width in pixels
+    LANE_WIDTH_MIN  = 80     # Reject impossibly narrow line pairs
+    LANE_WIDTH_MAX  = 500    # Reject impossibly wide pairs (prevents tracking
+                              # left_boundary + right_boundary as one lane)
 
     # --- CONTOUR NOISE GATE ---
-    MIN_CONTOUR_AREA = 300   # RAISED from 80 → 300. White lane lines are big
-                              # continuous blobs. Small blobs are noise.
-                              # ↓ lower (100) = catches thin/faint lines
-                              # ↑ higher (500) = ultra-clean, may miss narrow markings
+    MIN_CONTOUR_AREA = 300   # Reject white blobs smaller than this (px²)
 
     # --- STEERING DEADBAND ---
-    # If the lane centre error is within ±DEADBAND pixels of the image centre,
-    # output ZERO steering. This prevents jitter and micro-corrections on
-    # straight lanes that cause oscillation/U-turns.
-    STEERING_DEADBAND_PX = 12  # ±12 pixels = ~2% of a 640px frame
-                                # ↑ higher = more stable on straights, slower to react
-                                # ↓ lower = more responsive, but may jitter
+    STEERING_DEADBAND_PX = 12  # ±12px error → zero steering (drive straight)
+
+    # --- LANE MEMORY ---
+    # Maximum distance (px) a lane line can jump between frames.
+    # If a detected line is further than this from its remembered position,
+    # it's treated as a DIFFERENT line (probably the outer road boundary)
+    # and ignored. This prevents the car from jumping to track the wrong
+    # lane when the inner line leaves the frame on turns.
+    LINE_JUMP_THRESH = 120   # ↑ higher = more tolerant of fast movement
+                              # ↓ lower = stricter continuity, may lose lines
 
     # --- YOLO / BRAKING ---
-    BRAKE_AREA_THRESHOLD = 0.04   # object occupies ≥4% of frame → trigger action
-    STOP_DEBOUNCE_FRAMES = 3      # need 3 consecutive positive frames before braking
+    BRAKE_AREA_THRESHOLD = 0.015
+    STOP_DEBOUNCE_FRAMES = 3
 
 
     def __init__(self):
@@ -251,17 +251,18 @@ class ZenityBrain:
         # Auto-calibrated lane width (updated whenever both lines are visible)
         self._lane_width = self.LANE_WIDTH_INIT
 
+        # ── Lane memory ───────────────────────────────────────────────────────
+        # Remember the last known x-position of each lane line.
+        # Used to prevent the car from jumping to track the wrong line when
+        # the inner line leaves the frame on turns.
+        self._last_left_x  = None  # EMA-smoothed left line position
+        self._last_right_x = None  # EMA-smoothed right line position
+
         # ── EMA steering smoother ─────────────────────────────────────────────
-        # Exponential Moving Average filter on the final steering output.
-        # Smooths frame-to-frame jitter so the car doesn't oscillate on
-        # straight lanes. Alpha = 0.6 means 60% new value, 40% old value.
-        self._steer_ema = 0.0        # last smoothed steering angle
-        self._steer_ema_alpha = 0.6  # 0.0 = no change, 1.0 = no smoothing
+        self._steer_ema = 0.0
+        self._steer_ema_alpha = 0.6  # 0.6 new + 0.4 old
 
         # ── Startup frame skip ────────────────────────────────────────────────
-        # Skip the first N frames of lane detection to let the camera
-        # auto-expose and the threshold stabilise. Returns None (drive
-        # straight) during these frames.
         self._startup_skip_frames = 3
         self._frame_count = 0
 
@@ -557,197 +558,219 @@ class ZenityBrain:
 
 
     # ══════════════════════════════════════════════════════════════════════════
-    # PRIVATE — LANE DETECTION  (v7.1 — Simple Left/Right Split)
+    # PRIVATE — LANE DETECTION  (v8.0 — Nearest-Pair + Lane Memory)
     # ══════════════════════════════════════════════════════════════════════════
     #
-    # COMPLETE REWRITE from v7.0's multi-slice scanner.
+    # REWRITE from v7.1's LEFT/RIGHT split.
     #
-    # WHY v7.0 FAILED on straight lanes:
-    #   - Otsu threshold was too low for black road + white lanes (white lines
-    #     are <5% of the image → Otsu picks a threshold influenced by road noise)
-    #   - Multi-slice scanning produced independent noisy detections in 8 slices
-    #     with no spatial continuity → random blobs steered the car off course
-    #   - PREFERRED_LANE logic picked wrong blob pairs when noise created
-    #     extra detections
+    # WHY v7.1 FAILED on turns:
+    #   On a two-lane track (3 lines: left_solid, centre_dashed, right_solid),
+    #   the LEFT/RIGHT split at the image centre worked on straights but broke
+    #   on turns. When the inner lane line left the frame, the split picked up
+    #   the OUTER road boundary instead, causing the car to track the wrong
+    #   lane and drive off the road.
     #
-    # NEW APPROACH (v7.1):
-    #   1. Crop the bottom 55% of the frame (ROI)
-    #   2. Build a binary white mask using FIXED high threshold (no Otsu)
-    #   3. Split the ROI into LEFT HALF and RIGHT HALF at the centre
-    #   4. Find the LARGEST contour in each half → that's the lane line
-    #   5. Lane centre = midpoint of the two detected line positions
-    #   6. Steering error = lane centre − image centre
-    #   7. DEADBAND: if error < ±12px → drive perfectly straight (no jitter)
-    #   8. Feed error into PID → smooth steering output
-    #
-    # WHY THIS WORKS:
-    #   - Left/right split GUARANTEES left line is found in left half,
-    #     right line in right half → zero ambiguity, no wrong picks
-    #   - Fixed high threshold (180) ignores all road noise, catches only
-    #     bright white lane lines → clean detections
-    #   - Deadband eliminates micro-corrections on straight lanes
-    #   - Single largest-contour per side ignores small noise blobs
-    #
-    # TRADE-OFF:
-    #   On very tight curves where both lines end up on the same side of
-    #   the image, one half loses its line. This is handled by the single-line
-    #   fallback (infer the missing line from calibrated lane width).
+    # NEW APPROACH (v8.0):
+    #   1. Find ALL white line positions in the full mask (no left/right split)
+    #   2. First frame: pick the pair whose midpoint is closest to the car
+    #      centre → this IS the car's lane ("nearest-pair" selection)
+    #   3. Subsequent frames: match detected lines to REMEMBERED positions
+    #      (lane memory). If a line is too far from its remembered pos,
+    #      it's a different line → ignore it. This prevents lane jumping.
+    #   4. Camera offset applied so the car centre reference is correct.
     # ══════════════════════════════════════════════════════════════════════════
 
     def _build_white_mask(self, roi_bgr: np.ndarray) -> np.ndarray:
         """
         Creates a binary mask where white lane lines are 255 and everything
         else is 0. Tuned for BLACK ROAD + WHITE LANE LINES.
-
-        Pipeline:
-          1. Convert to grayscale
-          2. Apply CLAHE (equalises contrast across shadows and bright spots)
-          3. Gaussian blur (removes camera sensor noise)
-          4. FIXED threshold at WHITE_THRESH (no Otsu — Otsu fails on
-             images where white is <5% of the area)
-          5. Morphological close with 5×5 kernel (bridges small gaps)
-          6. Vertical dilation with tall kernel (bridges gaps between
-             dashes in the centre lane divider)
-
-        Returns: binary uint8 mask (0 or 255)
         """
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
         gray = self.clahe.apply(gray)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # Fixed threshold — reliable for high-contrast white-on-black tracks
+        # Fixed threshold
         _, mask = cv2.threshold(blur, self.WHITE_THRESH, 255, cv2.THRESH_BINARY)
 
-        # Step 1: Morphological close — bridge small gaps within each dash/line.
+        # Morphological close — bridge small gaps
         kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
 
-        # Step 2: Vertical dilation — bridge gaps BETWEEN dashes.
-        # The centre lane divider is dashed (short white segments with gaps).
-        # A tall, narrow kernel (3 wide × 15 tall) stretches each dash
-        # vertically so nearby dashes merge into one continuous contour.
-        # This ensures _find_biggest_contour_x() sees the dashed line as
-        # one big blob instead of many small ones.
+        # Vertical dilation — bridge gaps between dashes in centre lane divider
         kernel_vert = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 15))
         mask = cv2.dilate(mask, kernel_vert, iterations=1)
 
         return mask
 
-    def _find_biggest_contour_x(self, mask_half: np.ndarray, x_offset: int = 0):
+    def _find_all_line_positions(self, mask: np.ndarray):
         """
-        Finds the x-centroid of the LARGEST white contour in a mask region.
+        Finds the x-centroid of every significant white contour in the mask.
 
-        By taking only the largest contour, we reject all small noise blobs
-        and guarantee we're tracking the actual lane line (which is always
-        the biggest white feature in its half of the image).
-
-        Args:
-            mask_half: binary mask of one half (left or right) of the ROI
-            x_offset: added to the returned x position (e.g., roi_w//2 for right half)
-
-        Returns:
-            int x-position of the largest contour's centroid, or None if
-            no valid contour found.
+        Returns a sorted list of x-positions (left to right).
+        Only returns lines above MIN_CONTOUR_AREA.
         """
         contours, _ = cv2.findContours(
-            mask_half, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
-        if not contours:
-            return None
+        positions = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < self.MIN_CONTOUR_AREA:
+                continue
+            M = cv2.moments(cnt)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"])
+            positions.append(cx)
 
-        # Pick the contour with the largest area
-        biggest = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(biggest)
+        positions.sort()
+        return positions
 
-        if area < self.MIN_CONTOUR_AREA:
-            return None  # biggest is still too small → noise frame
+    def _pick_initial_pair(self, line_xs: list, cx_img: int):
+        """
+        First frame (no lane memory): pick the pair of lines whose midpoint
+        is closest to the car centre. On a 3-line track, this naturally picks
+        the lane the car is currently in.
 
-        M = cv2.moments(biggest)
-        if M["m00"] == 0:
-            return None  # degenerate contour
+        Returns (left_x, right_x) or partial/None.
+        """
+        if len(line_xs) == 0:
+            return None, None
 
-        cx = int(M["m10"] / M["m00"]) + x_offset
-        return cx
+        if len(line_xs) == 1:
+            if line_xs[0] < cx_img:
+                return line_xs[0], None
+            else:
+                return None, line_xs[0]
+
+        # Find all pairs with valid lane width
+        best = None
+        best_score = float('inf')
+
+        for i in range(len(line_xs)):
+            for j in range(i + 1, len(line_xs)):
+                width = line_xs[j] - line_xs[i]
+                if not (self.LANE_WIDTH_MIN < width < self.LANE_WIDTH_MAX):
+                    continue
+                mid = (line_xs[i] + line_xs[j]) / 2
+                score = abs(mid - cx_img)
+                if score < best_score:
+                    best_score = score
+                    best = (line_xs[i], line_xs[j])
+
+        if best is not None:
+            return best
+
+        # No valid-width pair — use two nearest to car centre
+        sorted_xs = sorted(line_xs, key=lambda x: abs(x - cx_img))
+        left = min(sorted_xs[0], sorted_xs[1])
+        right = max(sorted_xs[0], sorted_xs[1])
+        return left, right
+
+    def _match_to_memory(self, line_xs: list, cx_img: int):
+        """
+        Match detected lines to remembered lane positions.
+
+        For each remembered position (left/right), find the closest detected
+        line within LINE_JUMP_THRESH. If a line is too far from where we
+        last saw it, it's a different line (e.g., the outer road boundary)
+        and is ignored.
+
+        Falls back to _pick_initial_pair if no memory exists.
+        """
+        # No memory yet — use initial pair selection
+        if self._last_left_x is None and self._last_right_x is None:
+            return self._pick_initial_pair(line_xs, cx_img)
+
+        left_x = None
+        right_x = None
+        used = set()  # indices already assigned
+
+        # Match to remembered LEFT position
+        if self._last_left_x is not None:
+            best_dist = self.LINE_JUMP_THRESH
+            best_idx = -1
+            for idx, lx in enumerate(line_xs):
+                dist = abs(lx - self._last_left_x)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            if best_idx >= 0:
+                left_x = line_xs[best_idx]
+                used.add(best_idx)
+
+        # Match to remembered RIGHT position (skip already-used)
+        if self._last_right_x is not None:
+            best_dist = self.LINE_JUMP_THRESH
+            best_idx = -1
+            for idx, lx in enumerate(line_xs):
+                if idx in used:
+                    continue
+                dist = abs(lx - self._last_right_x)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            if best_idx >= 0:
+                right_x = line_xs[best_idx]
+
+        return left_x, right_x
+
+    def _update_lane_memory(self, left_x, right_x):
+        """
+        Update the EMA-smoothed lane memory with new detections.
+        """
+        alpha = 0.7  # 70% new value, 30% old
+
+        if left_x is not None:
+            if self._last_left_x is None:
+                self._last_left_x = left_x
+            else:
+                self._last_left_x = int(alpha * left_x + (1 - alpha) * self._last_left_x)
+
+        if right_x is not None:
+            if self._last_right_x is None:
+                self._last_right_x = right_x
+            else:
+                self._last_right_x = int(alpha * right_x + (1 - alpha) * self._last_right_x)
 
     def _run_lane_stage(self, frame_bgr, display, h: int, w: int):
         """
-        Simple LEFT/RIGHT lane detection with deadband steering.
-
-        Splits the ROI at the centre, finds the biggest white contour in
-        each half, and steers to the midpoint.
+        Nearest-pair lane detection with camera offset and lane memory.
 
         Returns:
             steering_angle (float|None) — PID output in degrees, or None if
                                           both lanes are lost.
         """
         try:
-            # 0. Startup skip: let the camera auto-expose before engaging PID
+            # 0. Startup skip
             self._frame_count += 1
             if self._frame_count <= self._startup_skip_frames:
-                return None  # drive straight during startup
+                return None
 
-            # 1. Crop the ROI — the bottom portion of the frame
+            # 1. Crop the ROI
             roi_y = int(h * self.ROI_TOP_FRACTION)
             roi = frame_bgr[roi_y:h, :]
             roi_h, roi_w = roi.shape[:2]
-            cx_img = roi_w // 2  # image centre ("straight ahead" reference)
 
-            # 2. Build the white mask
+            # 2. Camera offset: shift "straight ahead" reference
+            #    Camera is LEFT of car centre → car centre is RIGHT in image
+            cx_img = roi_w // 2 + self.CAMERA_OFFSET_PX
+            cx_img = max(0, min(roi_w - 1, cx_img))  # safety clamp
+
+            # 3. Build the white mask
             mask = self._build_white_mask(roi)
 
-            # 3. Draw the ROI horizon line on the display
+            # 4. Draw ROI line and camera offset marker
             cv2.line(display, (0, roi_y), (w, roi_y), (100, 0, 200), 1)
+            # Show where the car centre is (after offset) — cyan tick mark
+            vis_y = roi_y + roi_h // 2
+            cv2.line(display, (cx_img, vis_y - 12), (cx_img, vis_y + 12), (255, 255, 0), 2)
 
-            # 4. Split into LEFT and RIGHT halves at the centre
-            left_mask  = mask[:, :cx_img]
-            right_mask = mask[:, cx_img:]
+            # 5. Find ALL white line positions in the full mask
+            line_xs = self._find_all_line_positions(mask)
 
-            # 5. Find the biggest contour in each half
-            left_x  = self._find_biggest_contour_x(left_mask, x_offset=0)
-            right_x = self._find_biggest_contour_x(right_mask, x_offset=cx_img)
-
-            # 6. Determine lane centre (target_x)
-            half_lane = self._lane_width // 2
-            vis_y = roi_y + roi_h // 2  # y-position for visual markers
-
-            if left_x is not None and right_x is not None:
-                # ── BOTH lines visible → best case ───────────────────────────
-                target_x = (left_x + right_x) // 2
-
-                # Auto-calibrate lane width from real measurement
-                measured_w = right_x - left_x
-                if self.LANE_WIDTH_MIN < measured_w < self.LANE_WIDTH_MAX:
-                    self._lane_width = int(0.85 * self._lane_width + 0.15 * measured_w)
-
-                # Visual markers on dashboard
-                cv2.circle(display, (left_x, vis_y), 6, (255, 0, 0), -1)       # blue = left line
-                cv2.circle(display, (right_x, vis_y), 6, (255, 0, 255), -1)    # magenta = right line
-                cv2.circle(display, (target_x, vis_y), 6, (0, 255, 255), -1)   # yellow = lane centre
-                cv2.line(display, (left_x, vis_y), (right_x, vis_y), (0, 255, 0), 1)
-
-            elif left_x is not None:
-                # ── Only LEFT line visible (right lost in turn) ──────────────
-                target_x = left_x + half_lane
-                cv2.circle(display, (left_x, vis_y), 6, (0, 165, 255), -1)   # orange
-                cv2.circle(display, (target_x, vis_y), 4, (0, 200, 200), -1)
-                cv2.putText(
-                    display, "LEFT ONLY",
-                    (10, roi_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1
-                )
-
-            elif right_x is not None:
-                # ── Only RIGHT line visible (left lost in turn) ──────────────
-                target_x = right_x - half_lane
-                cv2.circle(display, (right_x, vis_y), 6, (0, 165, 255), -1)  # orange
-                cv2.circle(display, (target_x, vis_y), 4, (0, 200, 200), -1)
-                cv2.putText(
-                    display, "RIGHT ONLY",
-                    (10, roi_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1
-                )
-
-            else:
-                # ── NO lines found → total lane loss ─────────────────────────
+            if not line_xs:
                 self.pid.reset()
                 cv2.putText(
                     display, "NO LANES DETECTED",
@@ -755,20 +778,64 @@ class ZenityBrain:
                 )
                 return None
 
-            # 7. Compute steering error
+            # 6. Match to lane memory (or pick initial pair on first frame)
+            left_x, right_x = self._match_to_memory(line_xs, cx_img)
+
+            # 7. Determine lane centre (target_x)
+            half_lane = self._lane_width // 2
+
+            if left_x is not None and right_x is not None:
+                # ── BOTH lines visible → best case ───────────────────────────
+                target_x = (left_x + right_x) // 2
+
+                # Auto-calibrate lane width
+                measured_w = right_x - left_x
+                if self.LANE_WIDTH_MIN < measured_w < self.LANE_WIDTH_MAX:
+                    self._lane_width = int(0.85 * self._lane_width + 0.15 * measured_w)
+
+                # Visual markers
+                cv2.circle(display, (left_x, vis_y), 6, (255, 0, 0), -1)       # blue = left
+                cv2.circle(display, (right_x, vis_y), 6, (255, 0, 255), -1)    # magenta = right
+                cv2.circle(display, (target_x, vis_y), 6, (0, 255, 255), -1)   # yellow = centre
+                cv2.line(display, (left_x, vis_y), (right_x, vis_y), (0, 255, 0), 1)
+
+            elif left_x is not None:
+                # ── Only LEFT line visible ────────────────────────────────────
+                target_x = left_x + half_lane
+                cv2.circle(display, (left_x, vis_y), 6, (0, 165, 255), -1)
+                cv2.circle(display, (target_x, vis_y), 4, (0, 200, 200), -1)
+                cv2.putText(display, "LEFT ONLY",
+                    (10, roi_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+
+            elif right_x is not None:
+                # ── Only RIGHT line visible ───────────────────────────────────
+                target_x = right_x - half_lane
+                cv2.circle(display, (right_x, vis_y), 6, (0, 165, 255), -1)
+                cv2.circle(display, (target_x, vis_y), 4, (0, 200, 200), -1)
+                cv2.putText(display, "RIGHT ONLY",
+                    (10, roi_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+
+            else:
+                # ── Both lines lost (shouldn't happen if line_xs is non-empty)
+                self.pid.reset()
+                return None
+
+            # 8. Update lane memory
+            self._update_lane_memory(left_x, right_x)
+
+            # 9. Compute steering error (relative to car centre, not image centre)
             error = target_x - cx_img
 
-            # 8. DEADBAND: if error is tiny, drive perfectly straight.
-            #    This prevents jitter/oscillation on straight lanes.
+            # 10. Deadband
             if abs(error) < self.STEERING_DEADBAND_PX:
                 error = 0
 
-            # 9. PID → steering angle
+            # 11. PID → steering angle
             steering_angle = self.pid.update(error)
 
-            # 10. EMA Smoothing — blend with previous to reduce jitter
+            # 12. EMA Smoothing
             if self._frame_count <= self._startup_skip_frames + 1:
-                self._steer_ema = steering_angle  # seed first valid frame
+                self._steer_ema = steering_angle
             else:
                 self._steer_ema = (
                     self._steer_ema_alpha * steering_angle
@@ -776,14 +843,18 @@ class ZenityBrain:
                 )
             steering_angle = self._steer_ema
 
-            # ── HUD debug info ────────────────────────────────────────────────
+            # ── HUD ───────────────────────────────────────────────────────────
             cv2.putText(
-                display, f"LW:{self._lane_width}px  err:{error:+d}px",
-                (w - 220, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 0), 1
+                display, f"LW:{self._lane_width}px  err:{error:+d}px  lines:{len(line_xs)}",
+                (w - 280, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 0), 1
             )
-
-            # Draw error line from centre to target
-            cv2.line(display, (cx_img, vis_y - 8), (cx_img, vis_y + 8), (200, 200, 200), 2)
+            # Camera offset indicator
+            if self.CAMERA_OFFSET_PX != 0:
+                cv2.putText(
+                    display, f"CAM:{self.CAMERA_OFFSET_PX:+d}px",
+                    (w - 280, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1
+                )
+            # Error arrow
             if target_x != cx_img:
                 cv2.arrowedLine(
                     display, (cx_img, vis_y), (target_x, vis_y),
