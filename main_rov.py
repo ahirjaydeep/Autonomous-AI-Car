@@ -1,682 +1,870 @@
+
+# =============================================================================
+# AUTHOR'S NOTE
+# =============================================================================
+# This project, system design, logic flow, implementation decisions, testing,
+# tuning, and integration were developed by the author.
+#
+# AI-assisted tools were used to help generate parts of the code structure,
+# comments, formatting, documentation, and refactoring during development.
+#
+# Final architecture, engineering decisions, debugging, validation, and
+# production integration were performed and reviewed by the author.
+# =============================================================================
+
+
+
 """
 ================================================================================
- ZENITY ROV — main_rov7.py  |  "The Nervous System"
- Version: 7.0 (Production-Grade — Full State Machine)
+ ZENITY ROV — ai_engine8.py  |  "The Brain"
+ Version: 8.0 (Production — Camera Offset, Nearest-Pair Tracking, Lane Memory)
 ================================================================================
- Responsibilities:
-   - Camera thread:    pulls /shot.jpg from IP Webcam in a tight loop
-   - Heartbeat thread: sends PING to ESP32 at 2 Hz (watchdog keep-alive)
-   - UDP socket:       fires "L,R\n" PWM to ESP32 at up to 10 Hz
-   - State machine:    DRIVE → STOP → COOLDOWN → DRIVE (with LOST recovery)
-   - Speed zones:      dynamically adjusts BASE_SPEED from 30/40 sign detections
-   - HUD overlay:      real-time dashboard with state, steering, perf stats
-   - Graceful shutdown: sends STOP to ESP32 before Python exits
+ KEY IMPROVEMENTS over v7.1:
 
- UDP Packet format (UTF-8, newline-terminated):
-   Normal drive  →  "180,150\n"    (left_pwm, right_pwm)
-   Full stop     →  "0,0\n"
-   Reverse       →  "-100,-100\n"  (negative = backward)
-   Heartbeat     →  "PING\n"
+ CAMERA OFFSET:
+   - Corrects for phone camera mounted 6cm left of car centreline
+   - Configurable CAMERA_OFFSET_PX constant (default 55px)
 
- Compatible with: esp_rov7.ino (ESP32 firmware)
- AI Engine:       ai_engine7.py  (ZenityBrain v7.0)
+ NEAREST-PAIR LANE TRACKING:
+   - Replaces v7.1's LEFT/RIGHT split (which broke on turns)
+   - Finds ALL white lines in the full mask, picks the pair whose
+     midpoint is closest to the car centre → always tracks correct lane
+   - LANE_WIDTH_MAX = 500 rejects lane pairs that are too wide
+     (prevents tracking left_boundary + right_boundary as one "lane")
+
+ LANE MEMORY:
+   - Remembers last known position of left and right lane lines (EMA)
+   - On subsequent frames, matches detected lines to remembered positions
+   - If a new line is too far from its remembered position (LINE_JUMP_THRESH),
+     it's treated as a DIFFERENT line (e.g., outer road boundary) and ignored
+   - Prevents the car from "jumping" to track the wrong lane on turns
+
+ YOLO DETECTION:
+   - Same as v7.0 (unchanged)
 ================================================================================
 """
 
 import cv2
-import time
-import queue
-import socket
-import threading
-import requests
 import numpy as np
-import signal
-import sys
+import torch
+from ultralytics import YOLO
 from collections import deque
-
-try:
-    import kornia_rs as K
-    import torch
-    _USE_KORNIA = True
-except ImportError:
-    _USE_KORNIA = False
-    print("[main] kornia_rs not found — using cv2.imdecode (slower)")
-
-from ai_engine7 import ZenityBrain
+import time
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ▌ CONFIGURATION
-# ══════════════════════════════════════════════════════════════════════════════
-# ONLY this section should change between runs. Edit the IPs to match your
-# current network, adjust BASE_SPEED to taste, and you're ready to go.
-
-PHONE_IP   = "192.168.31.129"   # IP Webcam phone (Android app)
-ESP32_IP   = "10.48.167.62"    # ESP32 address (shown in Serial Monitor)
-ESP32_PORT = 4210              # UDP port — MUST match esp_rov7.ino
-
-STREAM_URL = f"http://{PHONE_IP}:8080/shot.jpg"
-
-# ── Speed constants (0–255 PWM) ───────────────────────────────────────────────
-# BASE_SPEED controls how fast the car drives straight. This is the
-# default; it can be overridden by speed zone detections (30/40 signs).
-BASE_SPEED = 90      # Default forward speed (used until a speed sign is seen)
-SLOW_SPEED = 55      # Speed during lane-lost recovery crawl
-
-# ── Speed Zone Mapping ───────────────────────────────────────────────────────
-# When a speed sign is detected close enough, BASE_SPEED is temporarily
-# changed to this value. The car returns to DEFAULT_BASE_SPEED if no zone
-# is detected for SPEED_ZONE_TIMEOUT seconds.
-SPEED_ZONE_MAP = {
-    30: 70,    # 30 sign → slow to PWM 70 (roughly 30% of max)
-    40: 90,    # 40 sign → PWM 90 (default speed — no change needed at 90)
-}
-DEFAULT_BASE_SPEED    = 90     # Speed when no zone is active
-SPEED_ZONE_TIMEOUT    = 8.0   # Seconds after last sign detection to reset speed
-
-# ── Startup grace period ─────────────────────────────────────────────────────
-# Number of frames to drive straight (BASE_SPEED, BASE_SPEED) before engaging
-# PID steering. This lets the lane detection stabilise and prevents the
-# derivative term from spiking on the very first frame.
-STARTUP_GRACE_FRAMES  = 5
-
-# ── Behaviour timings ─────────────────────────────────────────────────────────
-MAX_STOP_DURATION     = 3.0   # Seconds to hold brake after stop sign detected
-COOLDOWN_DURATION     = 3.0   # Seconds to ignore stop signs after resuming
-                               # (prevents re-triggering on the same sign)
-LOST_CRAWL_TIMEOUT    = 2.0   # Seconds of lane loss before entering LOST state
-COMMAND_HZ            = 10    # Motor command rate (Hz) — 100ms between commands
-HEARTBEAT_HZ          = 2     # ESP32 keep-alive rate (Hz)
-CAMERA_TIMEOUT_S      = 2.0   # Seconds with no frame → camera-down warning
-
-# ── Steering sensitivity ──────────────────────────────────────────────────────
-# The PID output (degrees) is divided by this to get a normalised [-1, 1] value.
-# Lower = sharper turns. Higher = gentler steering.
-STEER_DIVISOR = 35.0
-
-# ── Minimum wheel speed during turns ──────────────────────────────────────────
-# The slower wheel never drops below this PWM value. This prevents the car
-# from pivoting on one wheel (which looks like a U-turn). Instead, the slow
-# wheel keeps spinning forward slowly, making the car ARC through the turn.
-#   Too LOW (0-20)  → car can still pivot on tight turns
-#   Too HIGH (60+)  → car can't turn sharply enough for tight curves
-MIN_TURN_PWM = 40
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ▌ DRIVE STATE MACHINE
-# ══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+# PID CONTROLLER
+# ──────────────────────────────────────────────────────────────────────────────
+# A classic Proportional-Integral-Derivative controller used to convert
+# lateral pixel error (distance from lane centre) into a smooth steering angle.
 #
-# State diagram:
+# How it works:
+#   P (proportional) → reacts to current error (bigger error = harder turn)
+#   I (integral)     → reacts to accumulated past error (drift correction)
+#   D (derivative)   → reacts to rate of change (dampens oscillation)
 #
-#   ┌─────────┐  stop detected  ┌─────────┐  3s elapsed  ┌──────────┐  3s elapsed  ┌─────────┐
-#   │  DRIVE  │ ───────────────> │  STOP   │ ────────────>│ COOLDOWN │ ────────────> │  DRIVE  │
-#   └─────────┘                  └─────────┘              └──────────┘              └─────────┘
-#       │                                                      │
-#       │  lane lost > 2s                                      │ stop signs IGNORED
-#       ▼                                                      │ persons/red lights STILL TRIGGER
-#   ┌─────────┐                                                │
-#   │  LOST   │ ── lane reacquired ───────────────────────────>│
-#   └─────────┘                                                │
-#       │                                                      │
-#       │  stop detected (safety)                              │
-#       ▼                                                      │
-#   ┌─────────┐                                                │
-#   │  STOP   │ ──────────────────────────────────────────────>│
-#   └─────────┘
-#
-# ══════════════════════════════════════════════════════════════════════════════
+# Anti-windup: integral is clamped to prevent runaway values when the car
+# is stuck or lanes are lost for extended periods.
+# ──────────────────────────────────────────────────────────────────────────────
 
-class DriveState:
-    DRIVE    = "DRIVE"      # Normal lane-following
-    STOP     = "STOP"       # Braking (stop sign / red light / person)
-    COOLDOWN = "COOLDOWN"   # Post-stop immunity (ignores stop signs only)
-    LOST     = "LOST"       # Lane totally gone — crawl and search
-
-
-class StateMachine:
+class PIDController:
     """
-    Converts raw AI outputs into clean, debounced motor commands.
-    Handles all state transitions including stop-sign cooldown.
+    Discrete PID controller with anti-windup clamping.
 
-    The cooldown feature prevents the car from stopping twice at the same
-    stop sign: after the 3-second stop, the car drives for another 3 seconds
-    while ignoring stop sign detections. Person and red light detections
-    are NEVER suppressed — safety overrides convenience.
+    Tuning guide for Zenity ROV (4WD skid-steer):
+      kp = 0.22  → Aggressive enough to start turning at ~5px error.
+                    Increase if the car is sluggish on turns.
+                    Decrease if the car oscillates (wiggles side to side).
+      ki = 0.0   → Disabled. Integral is risky on a car that can lose lanes
+                    temporarily. Enable only if the car has persistent drift.
+      kd = 0.05  → Dampens overshoot when the car snaps back from a turn.
+                    Increase if the car overshoots past centre after curves.
+                    Decrease if the car feels too sluggish entering turns.
+                    (Reduced from 0.08 to prevent startup derivative spike.)
+      max_out = 35.0 → Maximum steering angle in degrees. The tank-drive
+                       mixer maps ±35° to full differential.
     """
 
-    def __init__(self):
-        self.state = DriveState.DRIVE
-        self._stop_ts = None       # timestamp when STOP was entered
-        self._cooldown_ts = None   # timestamp when COOLDOWN was entered
-        self._lost_ts = None       # timestamp when lane was first lost
+    def __init__(self, kp: float, ki: float, kd: float, max_out: float):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.max_out = max_out
 
-        # Dynamic speed: can be changed by speed zone detections
-        self.active_base_speed = DEFAULT_BASE_SPEED
-        self._last_speed_zone_ts = 0.0  # when the last speed zone sign was seen
+        self.integral = 0.0
+        self.prev_error = 0.0
 
-        # Startup grace: drive straight for the first N frames
-        self._startup_frames_remaining = STARTUP_GRACE_FRAMES
+        # Anti-windup: integral can never exceed this value
+        # (proportional component alone at this integral would hit max_out)
+        self._integral_limit = max_out / max(kp, 1e-6)
 
-    def update(self, stop_detected: bool, steering, detections: dict):
+    def update(self, error: float) -> float:
         """
-        Process one frame's AI results and return motor commands.
+        Feed a new error value and get the PID output.
 
         Args:
-            stop_detected: True if debounced stop condition confirmed by AI
-            steering: PID steering angle (float, deg) or None if lanes lost
-            detections: dict with keys 'speed_limit', 'person_close',
-                        'stop_sign_close', 'red_light'
+            error: signed pixel offset. Positive = car is LEFT of target
+                   (needs to steer right). Negative = car is RIGHT (steer left).
 
         Returns:
-            (left_pwm, right_pwm) — motor speeds (may be negative for reverse)
+            Steering angle in degrees, clamped to [-max_out, +max_out].
         """
-        now = time.time()
+        # I — accumulate error with clamping
+        self.integral = max(
+            -self._integral_limit,
+            min(self._integral_limit, self.integral + error)
+        )
 
-        # ── Speed Zone Handling (independent of state) 
-        # If a speed sign was detected close enough, adjust driving speed.
-        # This is checked in every state because we want the speed to update
-        # even during COOLDOWN or after LOST recovery.
-        self._handle_speed_zone(detections, now)
+        # D — rate of change of error
+        derivative = error - self.prev_error
+        self.prev_error = error
 
-        # ── DRIVE state 
-        if self.state == DriveState.DRIVE:
-            # Check for stop-triggering conditions
-            if stop_detected:
-                self._enter_stop(now)
-                return 0, 0
+        # PID formula
+        raw = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
 
-            # Check for lane loss
-            if steering is None:
-                if self._lost_ts is None:
-                    self._lost_ts = now
-                    print("[StateMachine] Lane lost — starting grace period")
+        # Clamp output to safe steering range
+        return max(-self.max_out, min(self.max_out, raw))
 
-                elapsed_lost = now - self._lost_ts
-                if elapsed_lost > LOST_CRAWL_TIMEOUT:
-                    print(f"[StateMachine] {elapsed_lost:.1f}s lane loss → LOST state")
-                    self.state = DriveState.LOST
-                    return 0, 0  # full stop — too dangerous to crawl blind
-
-                # Within grace period: crawl straight slowly
-                return SLOW_SPEED, SLOW_SPEED
-
-            # Startup grace: drive straight for the first N frames to let PID settle
-            if self._startup_frames_remaining > 0:
-                self._startup_frames_remaining -= 1
-                bs = self.active_base_speed
-                return bs, bs
-
-            # Normal driving: lane acquired, no stop condition
-            self._lost_ts = None
-            left, right = self._steering_to_tank(steering)
-            return left, right
-
-        # ── STOP state 
-        elif self.state == DriveState.STOP:
-            elapsed = now - self._stop_ts
-            if elapsed >= MAX_STOP_DURATION:
-                print(f"[StateMachine] Stop held {elapsed:.1f}s → COOLDOWN (ignoring stop signs for {COOLDOWN_DURATION}s)")
-                self.state = DriveState.COOLDOWN
-                self._cooldown_ts = now
-                self._lost_ts = None
-            return 0, 0  # motors stay off during entire STOP phase
-
-        # ── COOLDOWN state 
-        # Car is driving but ignoring stop signs. Still reacts to persons
-        # and red lights (safety is never suppressed).
-        elif self.state == DriveState.COOLDOWN:
-            elapsed = now - self._cooldown_ts
-
-            # Check if cooldown period is over
-            if elapsed >= COOLDOWN_DURATION:
-                print(f"[StateMachine] Cooldown expired → DRIVE (all detections active)")
-                self.state = DriveState.DRIVE
-                self._lost_ts = None
-                # Fall through to normal driving below
-
-            # During cooldown: only person and red light can stop us
-            if detections.get('person_close') or detections.get('red_light'):
-                print("[StateMachine] ⚠ Safety override during COOLDOWN — person/red light!")
-                self._enter_stop(now)
-                return 0, 0
-
-            # Normal driving (stop signs are suppressed)
-            if steering is None:
-                if self._lost_ts is None:
-                    self._lost_ts = now
-                elapsed_lost = now - self._lost_ts
-                if elapsed_lost > LOST_CRAWL_TIMEOUT:
-                    self.state = DriveState.LOST
-                    return 0, 0  # full stop
-                return SLOW_SPEED, SLOW_SPEED
-
-            self._lost_ts = None
-            left, right = self._steering_to_tank(steering)
-            return left, right
-
-        # ── LOST state 
-        elif self.state == DriveState.LOST:
-            # Safety: even while lost, react to stop conditions
-            if stop_detected:
-                self._enter_stop(now)
-                return 0, 0
-
-            # If lanes reappear, resume driving immediately
-            if steering is not None:
-                print("[StateMachine] Lane reacquired → DRIVE")
-                self.state = DriveState.DRIVE
-                self._lost_ts = None
-                left, right = self._steering_to_tank(steering)
-                return left, right
-
-            # Still lost — full stop (safer than driving blind)
-            return 0, 0
-
-        # Fallback safety net (should never reach here)
-        return 0, 0
-
-    def _enter_stop(self, ts: float):
-        """Transition to STOP state."""
-        self.state = DriveState.STOP
-        self._stop_ts = ts
-        print("[StateMachine] → STOP (braking)")
-
-    def _handle_speed_zone(self, detections: dict, now: float):
-        """
-        Dynamically adjusts base speed based on detected speed limit signs.
-        Resets to default if no sign has been seen for SPEED_ZONE_TIMEOUT seconds.
-        """
-        speed_limit = detections.get('speed_limit')
-
-        if speed_limit is not None and speed_limit in SPEED_ZONE_MAP:
-            new_speed = SPEED_ZONE_MAP[speed_limit]
-            if self.active_base_speed != new_speed:
-                print(f"[StateMachine] Speed zone detected: {speed_limit} → BASE_SPEED={new_speed}")
-            self.active_base_speed = new_speed
-            self._last_speed_zone_ts = now
-
-        elif self._last_speed_zone_ts > 0 and (now - self._last_speed_zone_ts) > SPEED_ZONE_TIMEOUT:
-            # No speed sign seen for a while — reset to default
-            if self.active_base_speed != DEFAULT_BASE_SPEED:
-                print(f"[StateMachine] Speed zone timeout → BASE_SPEED={DEFAULT_BASE_SPEED}")
-            self.active_base_speed = DEFAULT_BASE_SPEED
-
-    def _steering_to_tank(self, steering_deg: float):
-        """
-        Maps a signed PID steering angle to differential (tank / skid-steer) PWM.
-
-        PERCENTAGE-BASED FORMULA (v7.1 fix):
-          Instead of adding a fixed TURN_POWER offset (which caused U-turns
-          when TURN_POWER > BASE_SPEED), we now scale each wheel as a
-          percentage of BASE_SPEED:
-            left  = BASE_SPEED × (1 + t)
-            right = BASE_SPEED × (1 - t)
-
-          MIN_TURN_PWM floor ensures the slow wheel never stops completely,
-          preventing pivot turns that look like U-turns.
-
-          At t=0 (straight):    L=90,  R=90   (perfect straight line)
-          At t=0.5 (moderate):  L=135, R=45   (gentle turn)
-          At t=1.0 (max steer): L=180, R=40   (sharp arc, NOT a pivot)
-
-        Direction convention:
-          steering_deg > 0 → turn RIGHT → left motor faster, right slower
-          steering_deg < 0 → turn LEFT  → right motor faster, left slower
-        """
-        # Normalise to [-1, 1] — STEER_DIVISOR controls sensitivity
-        t = max(-1.0, min(1.0, steering_deg / STEER_DIVISOR))
-
-        # Percentage-based differential
-        bs = self.active_base_speed
-        left  = int(bs * (1.0 + t))
-        right = int(bs * (1.0 - t))
-
-        # Clamp: MIN_TURN_PWM floor prevents pivot turns (one wheel at 0),
-        # 255 ceiling prevents exceeding PWM range.
-        return (max(MIN_TURN_PWM, min(255, left)),
-                max(MIN_TURN_PWM, min(255, right)))
+    def reset(self):
+        """Reset integrator and derivative memory. Called on total lane loss."""
+        self.integral = 0.0
+        self.prev_error = 0.0
 
 
-# ▌ HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+# ZENITY BRAIN  v7.0
+# ──────────────────────────────────────────────────────────────────────────────
+# This is the main class that processes every camera frame through two
+# parallel pipelines:
+#   1) YOLO object detection → identifies stop signs, people, lights, etc.
+#   2) Lane detection → finds lane lines, computes steering angle via PID
+#
+# The constructor loads the YOLO model, initialises the PID controller,
+# and performs a warm-up inference to JIT-compile the model.
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _send_udp(sock: socket.socket, addr: tuple, payload: str):
+class ZenityBrain:
     """
-    Fire-and-forget UDP send. Non-blocking, silently absorbs errors.
-    For motor control, a dropped packet is better than a blocking one
-    (the car just holds its previous heading for one cycle).
+    AI perception engine for Zenity ROV.
+
+    process_frame() is the single public API called by main_rov7.py on every
+    new camera frame. It returns:
+        display        (np.ndarray)  — annotated BGR frame for the dashboard
+        steering_angle (float|None)  — signed degrees; negative=left, positive=right
+        stop_detected  (bool)        — True when debounced stop condition confirmed
+        detections     (dict)        — metadata: {'speed_limit': int|None, 'person': bool, ...}
     """
-    try:
-        sock.sendto(payload.encode(), addr)
-    except OSError:
-        pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TUNEABLE CONSTANTS  (v8.0 — Camera Offset + Nearest-Pair Tracking)
+    # ══════════════════════════════════════════════════════════════════════════
+    # ADJUST THESE FIRST before changing any logic.
+
+    # --- CAMERA OFFSET ---
+    # The phone camera is NOT centred on the chassis. It is mounted ~6cm LEFT
+    # of the car's centreline. In the image, the car's true centre appears
+    # shifted RIGHT of the image centre.
+    # This offset corrects for that: cx_img = image_centre + CAMERA_OFFSET_PX.
+    #
+    # HOW TO CALIBRATE:
+    #   1. Place car perfectly centred on a straight lane
+    #   2. Run the AI, look at the dashboard
+    #   3. If the green arrow points RIGHT → increase this value
+    #   4. If the green arrow points LEFT  → decrease this value
+    #   5. When the arrow is near-zero on a straight lane, you're done
+    #
+    # Rough estimate: ~9 px/cm at typical phone height (25-30cm).
+    #   6 cm × 9 px/cm ≈ 55 pixels.
+    CAMERA_OFFSET_PX = 0    # positive = camera is LEFT of car centre
+                              # ↑ increase if car still drifts left
+                              # ↓ decrease if car drifts right
+                              # Set to 0 if camera IS centred
+
+    # --- WHITE LINE DETECTION ---
+    WHITE_THRESH = 180       # Fixed threshold for white-on-black tracks
+                              # ↑ higher (200) = only catches bright white
+                              # ↓ lower (150) = catches dimmer lines, more noise
+
+    # --- ROI (Region of Interest) ---
+    ROI_TOP_FRACTION = 0.45  # Bottom 55% of frame (near-road focus)
+
+    # --- LANE GEOMETRY ---
+    LANE_WIDTH_INIT = 260    # Initial guess for lane width in pixels
+    LANE_WIDTH_MIN  = 80     # Reject impossibly narrow line pairs
+    LANE_WIDTH_MAX  = 500    # Reject impossibly wide pairs (prevents tracking
+                              # left_boundary + right_boundary as one lane)
+
+    # --- CONTOUR NOISE GATE ---
+    MIN_CONTOUR_AREA = 300   # Reject white blobs smaller than this (px²)
+
+    # --- STEERING DEADBAND ---
+    STEERING_DEADBAND_PX = 12  # ±12px error → zero steering (drive straight)
+
+    # --- LANE MEMORY ---
+    # Maximum distance (px) a lane line can jump between frames.
+    # If a detected line is further than this from its remembered position,
+    # it's treated as a DIFFERENT line (probably the outer road boundary)
+    # and ignored. This prevents the car from jumping to track the wrong
+    # lane when the inner line leaves the frame on turns.
+    LINE_JUMP_THRESH = 120   # ↑ higher = more tolerant of fast movement
+                              # ↓ lower = stricter continuity, may lose lines
+
+    # --- YOLO / BRAKING ---
+    BRAKE_AREA_THRESHOLD = 0.015
+    STOP_DEBOUNCE_FRAMES = 3
 
 
-# ▌ CAMERA THREAD
+    def __init__(self):
+        # ── Model Loading ─────────────────────────────────────────────────────
+        # Uses yolo26s.pt — the Small model. Good balance of speed and accuracy.
+        # Swap to yolo26n.pt (Nano) for faster but less accurate inference.
+        # Swap to yolo11s.pt or a custom zenity_master.pt if you have one.
+        model_path = "best.pt"
+        print(f"[ZenityBrain] Loading {model_path} …")
 
-def camera_thread(q: queue.Queue, stop_event: threading.Event):
-    """
-    Background thread that pulls /shot.jpg from the phone in a tight loop.
+        self.yolo = YOLO(model_path)
 
-    Only the NEWEST frame is kept — old frames are immediately discarded.
-    This eliminates buffer bloat: the AI always processes the most current
-    view, not a frame from 500ms ago.
+        # Pin model to the fastest available accelerator.
+        # MPS = Apple Silicon GPU (M1/M2/M3/M4) — fastest on Mac.
+        # CUDA = NVIDIA GPU — use if running on a Linux/Windows GPU machine.
+        # CPU = fallback — works everywhere but slow.
+        if torch.backends.mps.is_available():
+            self.device = "mps"
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        else:
+            self.device = "cpu"
+        self.yolo.to(self.device)
+        print(f"[ZenityBrain] Model pinned to → {self.device.upper()}")
 
-    Decoding priority:
-      1. kornia_rs (Rust-native, DLPack zero-copy) — ~2x faster on Apple Silicon
-      2. cv2.imdecode (C++ OpenCV) — fallback if kornia not installed
+        # ── Sub-systems ───────────────────────────────────────────────────────
+        # PID controller — converts pixel error into steering angle
+        self.pid = PIDController(kp=0.22, ki=0.0, kd=0.05, max_out=35.0)
 
-    Error handling:
-      Exponential backoff on failures (caps at 1 second) to avoid hammering
-      the phone when it's temporarily unreachable.
-    """
-    session = requests.Session()
-    session.headers.update({"Connection": "keep-alive"})
-    decoder = (K.ImageDecoder() if _USE_KORNIA else None)
-    backoff = 0.05
-    consecutive_errors = 0
+        # CLAHE — Contrast-Limited Adaptive Histogram Equalisation
+        # Normalises lighting across the frame so lane lines are consistent
+        # brightness whether they're in shadow or direct light.
+        self.clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
 
-    while not stop_event.is_set():
+        # Stop-sign debounce buffer: tracks last N detection results
+        self._stop_buffer: deque = deque(maxlen=self.STOP_DEBOUNCE_FRAMES)
+
+        # Auto-calibrated lane width (updated whenever both lines are visible)
+        self._lane_width = self.LANE_WIDTH_INIT
+
+        # ── Lane memory ───────────────────────────────────────────────────────
+        # Remember the last known x-position of each lane line.
+        # Used to prevent the car from jumping to track the wrong line when
+        # the inner line leaves the frame on turns.
+        self._last_left_x  = None  # EMA-smoothed left line position
+        self._last_right_x = None  # EMA-smoothed right line position
+
+        # ── EMA steering smoother ─────────────────────────────────────────────
+        self._steer_ema = 0.0
+        self._steer_ema_alpha = 0.6  # 0.6 new + 0.4 old
+
+        # ── Startup frame skip ────────────────────────────────────────────────
+        self._startup_skip_frames = 3
+        self._frame_count = 0
+
+        # ── Warm-up ───────────────────────────────────────────────────────────
+        # Run a dummy inference to force PyTorch to JIT-compile the model.
+        # Without this, the first real frame takes 2-5 seconds.
+        print("[ZenityBrain] Warm-up inference …")
+        dummy = np.zeros((320, 320, 3), dtype=np.uint8)
+        self._run_yolo(dummy)
+        print("[ZenityBrain] Ready ✓\n")
+
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PUBLIC API
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def process_frame(self, frame_bgr: np.ndarray):
+        """
+        Main entry point. Called by main_rov7.py on every new camera frame.
+
+        Args:
+            frame_bgr: Raw BGR image from the camera (any resolution).
+
+        Returns:
+            display        — Annotated BGR frame with bounding boxes, lane markers, HUD.
+            steering_angle — Signed steering angle in degrees. None if lanes are totally lost.
+            stop_detected  — True if a debounced stop condition is confirmed.
+            detections     — Dict with metadata:
+                             {
+                               'speed_limit': int|None,  # 30 or 40 if detected, else None
+                               'person_close': bool,     # True if person within braking distance
+                               'stop_sign_close': bool,  # True if stop sign within braking distance
+                               'red_light': bool,        # True if red traffic light detected
+                             }
+        """
+        # ── Sanity check ─────────────────────────────────────────────────────
+        # Corrupted or empty frames arrive over flaky Wi-Fi connections.
+        if frame_bgr is None or frame_bgr.size == 0:
+            print("[ZenityBrain] ⚠ Received empty/corrupted frame — skipping")
+            return None, None, False, {}
+
+        h, w = frame_bgr.shape[:2]
+        frame_area = w * h
+        display = frame_bgr.copy()
+
+        # ── Stage 1: YOLO Object Detection ────────────────────────────────────
+        # Detects stop signs, people, traffic lights, speed signs, parking signs.
+        # Returns raw stop flag + metadata dict.
+        stop_raw, detections = self._run_yolo_stage(frame_bgr, display, frame_area)
+
+        # Debounce: require N consecutive positive frames before confirming stop.
+        # This prevents a single flickering detection from causing a brake event.
+        self._stop_buffer.append(stop_raw)
+        stop_detected = (
+            len(self._stop_buffer) == self.STOP_DEBOUNCE_FRAMES
+            and all(self._stop_buffer)
+        )
+
+        # ── Stage 2: Lane Detection + PID Steering ────────────────────────────
+        # Finds lane lines using multi-slice scanning, computes steering angle.
+        steering_angle = self._run_lane_stage(frame_bgr, display, h, w)
+
+        return display, steering_angle, stop_detected, detections
+
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PRIVATE — YOLO STAGE
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _run_yolo(self, frame):
+        """
+        Raw YOLO inference call. Isolated so warm-up can call it without
+        the full detection pipeline.
+
+        Uses imgsz=320 for speed. Increase to 640 for more accuracy but
+        ~4x slower inference (not recommended for real-time driving).
+        """
+        return self.yolo(
+            frame,
+            conf=0.45,        # confidence threshold — objects below 45% are ignored
+            imgsz=320,        # input resolution — 320px is the speed/accuracy sweet spot
+            verbose=False,    # suppress YOLO's own console output
+            device=self.device,
+        )
+
+    def _run_yolo_stage(self, frame_bgr, display, frame_area: int):
+        """
+        Runs YOLO detection, draws bounding boxes, classifies traffic lights,
+        and determines if any stop-triggering object is close enough.
+
+        STRICT CLASS FILTERING: Only processes Person, Stop, Traffic Light,
+        30, 40, and Parking. All other YOLO classes (laptop, TV, etc.) are
+        silently ignored — they're false positives from the COCO pretrained model.
+
+        Returns:
+            stop_close (bool) — raw (not debounced) stop trigger
+            detections (dict) — metadata about what was detected
+        """
+        stop_close = False
+        detections = {
+            'speed_limit': None,      # will be set to 30 or 40 if detected
+            'person_close': False,
+            'stop_sign_close': False,
+            'red_light': False,
+        }
+
         try:
-            resp = session.get(STREAM_URL, timeout=1.5)
-            resp.raise_for_status()
+            results = self._run_yolo(frame_bgr)
 
-            # ── Decode the JPEG bytes to a BGR numpy array 
-            if _USE_KORNIA and decoder is not None:
-                decoded = decoder.decode(resp.content)
-                img_bgr = cv2.cvtColor(
-                    torch.from_dlpack(decoded).numpy(), cv2.COLOR_RGB2BGR
-                )
-            else:
-                arr = np.frombuffer(resp.content, dtype=np.uint8)
-                img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            for r in results:
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-            if img_bgr is None:
-                raise ValueError("Decoded frame is None (corrupt JPEG?)")
+                    # Get the class name from the model's dictionary
+                    class_name = self.yolo.names[cls_id].upper()
 
-            # ── Always keep only the newest frame 
-            if q.full():
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    pass
-            q.put(img_bgr)
+                    # ── STRICT FILTER: Only process our target classes ────────
+                    # This list must match your custom-trained model's classes.
+                    # For COCO-pretrained models, "PERSON" and "STOP SIGN" work.
+                    # For custom models, add your exact class names here.
+                    valid_targets = [
+                        "PERSON", "STOP", "TRAFFIC LIGHT", "LIGHT",
+                        "30", "40", "PARKING"
+                    ]
+                    if not any(target in class_name for target in valid_targets):
+                        continue  # skip irrelevant classes (laptop, TV, etc.)
 
-            backoff = 0.05
-            consecutive_errors = 0
+                    box_area = (x2 - x1) * (y2 - y1)
+                    area_ratio = box_area / frame_area
+
+                    color = (255, 100, 0)  # default: orange
+                    label = f"{class_name} {conf:.2f}"
+
+                    # ── PERSON — Emergency Stop ──────────────────────────────
+                    # A person within braking distance triggers immediate stop.
+                    # This is the highest-priority AI detection (above stop signs).
+                    if "PERSON" in class_name:
+                        if area_ratio >= self.BRAKE_AREA_THRESHOLD:
+                            stop_close = True
+                            detections['person_close'] = True
+                            color = (0, 0, 255)  # red box
+                            label = "⚠ BRAKING — PERSON IN PATH"
+                            cv2.putText(
+                                display, "BRAKING — PERSON IN PATH",
+                                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2
+                            )
+                        else:
+                            color = (255, 100, 0)  # orange — detected but far
+                            label = f"PERSON AHEAD (d:{area_ratio:.3f})"
+
+                    # ── STOP SIGN — Brake on Proximity ───────────────────────
+                    # Only triggers when the sign is large enough in frame (close).
+                    # The debounce + cooldown logic is in main_rov7.py.
+                    elif "STOP" in class_name:
+                        if area_ratio >= self.BRAKE_AREA_THRESHOLD:
+                            stop_close = True
+                            detections['stop_sign_close'] = True
+                            color = (0, 0, 255)
+                            label = "⚠ BRAKING — STOP SIGN"
+                            cv2.putText(
+                                display, "BRAKING — STOP SIGN CLOSE",
+                                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2
+                            )
+                        else:
+                            color = (0, 165, 255)  # orange — seen but far
+                            label = f"STOP AHEAD (d:{area_ratio:.3f})"
+
+                    # ── TRAFFIC LIGHT — HSV Color Classifier ─────────────────
+                    # The bounding box is passed to a separate classifier that
+                    # counts red vs green pixels in HSV space.
+                    elif "TRAFFIC LIGHT" in class_name or "LIGHT" in class_name:
+                        light_state, _ = self._classify_traffic_light(
+                            frame_bgr, x1, y1, x2, y2
+                        )
+                        label = f"LIGHT:{light_state} {conf:.2f}"
+                        if light_state == "RED":
+                            stop_close = True
+                            detections['red_light'] = True
+                            color = (0, 0, 255)
+                            cv2.putText(
+                                display, "RED LIGHT — STOPPING",
+                                (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2
+                            )
+                        elif light_state == "GREEN":
+                            color = (0, 255, 0)
+
+                    # ── SPEED 30 — Speed Zone Enforcement ────────────────────
+                    # When close enough, reports speed_limit=30 to main_rov7.py.
+                    # main_rov7.py will reduce BASE_SPEED accordingly.
+                    elif "30" in class_name:
+                        if area_ratio >= self.BRAKE_AREA_THRESHOLD:
+                            detections['speed_limit'] = 30
+                            color = (0, 255, 255)  # cyan
+                            label = "30 ZONE ENFORCED"
+                            cv2.putText(
+                                display, "SPEED LIMIT: 30",
+                                (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2
+                            )
+                        else:
+                            color = (0, 200, 200)
+                            label = f"30 SPEED (d:{area_ratio:.3f})"
+
+                    # ── SPEED 40 — Speed Zone Enforcement ────────────────────
+                    elif "40" in class_name:
+                        if area_ratio >= self.BRAKE_AREA_THRESHOLD:
+                            detections['speed_limit'] = 40
+                            color = (0, 255, 255)
+                            label = "40 ZONE ENFORCED"
+                            cv2.putText(
+                                display, "SPEED LIMIT: 40",
+                                (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2
+                            )
+                        else:
+                            color = (0, 200, 200)
+                            label = f"40 SPEED (d:{area_ratio:.3f})"
+
+                    # ── PARKING — Auto-Park Sign ─────────────────────────────
+                    # Currently display-only. Future: trigger parking routine.
+                    elif "PARKING" in class_name:
+                        if area_ratio >= self.BRAKE_AREA_THRESHOLD:
+                            color = (255, 0, 255)  # magenta
+                            label = "AUTO-PARK INITIATED"
+                        else:
+                            color = (200, 0, 200)
+                            label = f"PARKING (d:{area_ratio:.3f})"
+
+                    # ── Draw bounding box + label on display ─────────────────
+                    cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(
+                        display, label, (x1, max(y1 - 8, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2
+                    )
 
         except Exception as exc:
-            consecutive_errors += 1
-            if consecutive_errors <= 3 or consecutive_errors % 20 == 0:
-                print(f"[Camera] Error #{consecutive_errors}: {exc} — retry in {backoff:.2f}s")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 1.0)
+            print(f"[ZenityBrain] YOLO error: {exc}")
+
+        return stop_close, detections
 
 
-# ▌ HEARTBEAT THREAD
+    # ══════════════════════════════════════════════════════════════════════════
+    # PRIVATE — TRAFFIC LIGHT CLASSIFIER
+    # ══════════════════════════════════════════════════════════════════════════
 
-def heartbeat_thread(sock: socket.socket, addr: tuple, stop_event: threading.Event):
-    """
-    Sends "PING\n" to the ESP32 at HEARTBEAT_HZ (default: 2 Hz).
+    def _classify_traffic_light(self, frame_bgr, x1, y1, x2, y2):
+        """
+        Classifies a traffic light bounding box as RED, GREEN, or UNKNOWN.
 
-    Purpose: proves to the ESP32 that the Python brain is alive. If this
-    thread stops (Python crash, freeze, Wi-Fi drop), the ESP32's watchdog
-    timer fires and kills the motors automatically.
+        Method:
+          1. Crop the bounding box from the frame
+          2. Divide vertically into thirds (top = red zone, bottom = green zone)
+          3. Convert to HSV colour space
+          4. Count saturated red pixels in the top third
+          5. Count saturated green pixels in the bottom third
+          6. Whichever has more → that's the light state
 
-    The heartbeat is sent on the SAME UDP socket as motor commands.
-    """
-    interval = 1.0 / HEARTBEAT_HZ
-    while not stop_event.is_set():
-        _send_udp(sock, addr, "PING\n")
-        time.sleep(interval)
+        HSV ranges:
+          Red:   hue 0-10 and 160-180 (red wraps around in HSV)
+          Green: hue 40-90
 
+        Returns: (state_string, bgr_color_tuple)
+        """
+        # Guard against boxes going outside the frame
+        fh, fw = frame_bgr.shape[:2]
+        x1, y1 = max(x1, 0), max(y1, 0)
+        x2, y2 = min(x2, fw), min(y2, fh)
 
-# ▌ PERFORMANCE TRACKER
+        roi = frame_bgr[y1:y2, x1:x2]
+        if roi.size == 0:
+            return "UNKNOWN", (200, 200, 200)
 
-class PerfTracker:
-    """
-    Tracks rolling-window FPS and average AI latency for the HUD.
+        roi_h = roi.shape[0]
+        third = max(roi_h // 3, 1)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    Uses a deque of timestamps to compute frames-per-second over the last
-    N frames (default: 30). This smooths out individual frame spikes
-    and gives a stable readout.
-    """
+        # Red spans two hue ranges in OpenCV's HSV (0-180 scale)
+        red_mask = cv2.bitwise_or(
+            cv2.inRange(hsv, (0, 120, 70), (10, 255, 255)),
+            cv2.inRange(hsv, (160, 120, 70), (180, 255, 255)),
+        )
+        green_mask = cv2.inRange(hsv, (40, 70, 70), (90, 255, 255))
 
-    def __init__(self, window: int = 30):
-        self._times: deque = deque(maxlen=window)
-        self._latencies: deque = deque(maxlen=window)
+        # Count pixels in their respective zones
+        red_px = cv2.countNonZero(red_mask[:third, :])       # top third
+        green_px = cv2.countNonZero(green_mask[2 * third:, :])  # bottom third
 
-    def tick(self, latency_ms: float):
-        """Record one frame's timestamp and AI latency."""
-        self._times.append(time.perf_counter())
-        self._latencies.append(latency_ms)
-
-    @property
-    def fps(self) -> float:
-        """Smoothed frames-per-second over the rolling window."""
-        if len(self._times) < 2:
-            return 0.0
-        return (len(self._times) - 1) / (self._times[-1] - self._times[0] + 1e-9)
-
-    @property
-    def avg_latency(self) -> float:
-        """Average AI processing time in milliseconds."""
-        return sum(self._latencies) / max(len(self._latencies), 1)
-
-
-# ▌ HUD OVERLAY
-
-# Style mapping: state → (label_text, BGR_color)
-_STATE_STYLE = {
-    DriveState.DRIVE:    ("DRIVE",    (0, 220, 0)),      # green
-    DriveState.STOP:     ("STOP",     (0, 0, 255)),      # red
-    DriveState.COOLDOWN: ("COOLDOWN", (255, 200, 0)),    # cyan-ish
-    DriveState.LOST:     ("LOST",     (0, 165, 255)),    # orange
-}
+        if red_px > green_px and red_px > 5:
+            return "RED", (0, 0, 255)
+        elif green_px > red_px and green_px > 5:
+            return "GREEN", (0, 255, 0)
+        return "UNKNOWN", (200, 200, 200)
 
 
-def _draw_hud(display, state_machine, left, right, steering, latency_ms, fps):
-    """
-    Draws a clean informational overlay on the dashboard frame.
+    # ══════════════════════════════════════════════════════════════════════════
+    # PRIVATE — LANE DETECTION  (v8.0 — Nearest-Pair + Lane Memory)
+    # ══════════════════════════════════════════════════════════════════════════
+    #
+    # REWRITE from v7.1's LEFT/RIGHT split.
+    #
+    # WHY v7.1 FAILED on turns:
+    #   On a two-lane track (3 lines: left_solid, centre_dashed, right_solid),
+    #   the LEFT/RIGHT split at the image centre worked on straights but broke
+    #   on turns. When the inner lane line left the frame, the split picked up
+    #   the OUTER road boundary instead, causing the car to track the wrong
+    #   lane and drive off the road.
+    #
+    # NEW APPROACH (v8.0):
+    #   1. Find ALL white line positions in the full mask (no left/right split)
+    #   2. First frame: pick the pair whose midpoint is closest to the car
+    #      centre → this IS the car's lane ("nearest-pair" selection)
+    #   3. Subsequent frames: match detected lines to REMEMBERED positions
+    #      (lane memory). If a line is too far from its remembered pos,
+    #      it's a different line → ignore it. This prevents lane jumping.
+    #   4. Camera offset applied so the car centre reference is correct.
+    # ══════════════════════════════════════════════════════════════════════════
 
-    Elements:
-      - Top banner: state, motor PWMs, steering angle, speed zone
-      - Bottom-right: FPS and AI latency
-      - Bottom-centre: steering gauge bar (visual representation)
-    """
-    h, w = display.shape[:2]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    state = state_machine.state
+    def _build_white_mask(self, roi_bgr: np.ndarray) -> np.ndarray:
+        """
+        Creates a binary mask where white lane lines are 255 and everything
+        else is 0. Tuned for BLACK ROAD + WHITE LANE LINES.
+        """
+        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+        gray = self.clahe.apply(gray)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # ── Top banner (semi-transparent black) 
-    overlay = display.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 52), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.55, display, 0.45, 0, display)
+        # Fixed threshold
+        _, mask = cv2.threshold(blur, self.WHITE_THRESH, 255, cv2.THRESH_BINARY)
 
-    # State label
-    label, color = _STATE_STYLE.get(state, ("???", (200, 200, 200)))
-    cv2.putText(display, f"[{label}]", (8, 34), font, 0.85, color, 2)
+        # Morphological close — bridge small gaps
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
 
-    # Motor PWMs
-    cv2.putText(
-        display, f"L:{left:+4d}  R:{right:+4d}",
-        (170, 34), font, 0.68, (255, 255, 255), 2
-    )
+        # Vertical dilation — bridge gaps between dashes in centre lane divider
+        kernel_vert = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 15))
+        mask = cv2.dilate(mask, kernel_vert, iterations=1)
 
-    # Steering angle
-    steer_str = f"Steer:{steering:+6.1f}°" if steering is not None else "Steer:  LOST"
-    steer_col = (200, 200, 255) if steering is not None else (0, 100, 255)
-    cv2.putText(display, steer_str, (400, 34), font, 0.62, steer_col, 2)
+        return mask
 
-    # Active speed zone
-    spd = state_machine.active_base_speed
-    if spd != DEFAULT_BASE_SPEED:
-        cv2.putText(
-            display, f"ZONE:{spd}",
-            (w - 130, 34), font, 0.6, (0, 255, 255), 2
+    def _find_all_line_positions(self, mask: np.ndarray):
+        """
+        Finds the x-centroid of every significant white contour in the mask.
+
+        Returns a sorted list of x-positions (left to right).
+        Only returns lines above MIN_CONTOUR_AREA.
+        """
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
-    # ── Bottom-right: performance stats 
-    cv2.putText(
-        display, f"{fps:.1f} FPS  {latency_ms:.1f}ms",
-        (w - 220, h - 10), font, 0.6, (100, 255, 100), 1
-    )
+        positions = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < self.MIN_CONTOUR_AREA:
+                continue
+            M = cv2.moments(cnt)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"])
+            positions.append(cx)
 
-    # ── Bottom-centre: steering gauge bar 
-    # A horizontal bar that shows the steering direction visually.
-    bar_cx = w // 2
-    bar_y = h - 20
-    bar_hw = 80  # half-width of the gauge
+        positions.sort()
+        return positions
 
-    # Background bar (dark grey)
-    cv2.rectangle(
-        display, (bar_cx - bar_hw, bar_y - 6),
-        (bar_cx + bar_hw, bar_y + 6), (50, 50, 50), -1
-    )
+    def _pick_initial_pair(self, line_xs: list, cx_img: int):
+        """
+        First frame (no lane memory): pick the pair of lines whose midpoint
+        is closest to the car centre. On a 3-line track, this naturally picks
+        the lane the car is currently in.
 
-    # Steering indicator (filled towards the turn direction)
-    if steering is not None:
-        norm = np.clip(steering / 35.0, -1.0, 1.0)
-        indicator_x = int(bar_cx + norm * bar_hw)
-        bar_color = (0, 200, 255) if abs(steering) < 15 else (0, 80, 255)
-        cv2.rectangle(
-            display, (bar_cx, bar_y - 6),
-            (indicator_x, bar_y + 6), bar_color, -1
-        )
+        Returns (left_x, right_x) or partial/None.
+        """
+        if len(line_xs) == 0:
+            return None, None
 
-    # Centre tick mark
-    cv2.line(display, (bar_cx, bar_y - 10), (bar_cx, bar_y + 10), (200, 200, 200), 1)
+        if len(line_xs) == 1:
+            if line_xs[0] < cx_img:
+                return line_xs[0], None
+            else:
+                return None, line_xs[0]
 
+        # Find all pairs with valid lane width
+        best = None
+        best_score = float('inf')
 
-# ▌ MAIN LOOP
+        for i in range(len(line_xs)):
+            for j in range(i + 1, len(line_xs)):
+                width = line_xs[j] - line_xs[i]
+                if not (self.LANE_WIDTH_MIN < width < self.LANE_WIDTH_MAX):
+                    continue
+                mid = (line_xs[i] + line_xs[j]) / 2
+                score = abs(mid - cx_img)
+                if score < best_score:
+                    best_score = score
+                    best = (line_xs[i], line_xs[j])
 
-def main():
-    print("=" * 64)
-    print("  ZENITY ROV  |  v7.0  |  Initialising…")
-    print("=" * 64)
-    print(f"  Phone IP:  {PHONE_IP}")
-    print(f"  ESP32 IP:  {ESP32_IP}:{ESP32_PORT}")
-    print(f"  Base Speed: {BASE_SPEED}   Steer Divisor: {STEER_DIVISOR}")
-    print(f"  Stop Duration: {MAX_STOP_DURATION}s   Cooldown: {COOLDOWN_DURATION}s")
-    print(f"  kornia_rs: {'✓ enabled' if _USE_KORNIA else '✗ disabled (using cv2)'}")
-    print("=" * 64)
+        if best is not None:
+            return best
 
-    # ── Subsystem init 
-    ai_brain = ZenityBrain()               # AI perception engine
-    state_machine = StateMachine()          # State machine + speed zones
-    perf = PerfTracker()                    # FPS / latency monitor
-    stop_event = threading.Event()          # Shared stop signal for all threads
+        # No valid-width pair — use two nearest to car centre
+        sorted_xs = sorted(line_xs, key=lambda x: abs(x - cx_img))
+        left = min(sorted_xs[0], sorted_xs[1])
+        right = max(sorted_xs[0], sorted_xs[1])
+        return left, right
 
-    # ── UDP socket (shared by main loop + heartbeat thread) 
-    esp_addr = (ESP32_IP, ESP32_PORT)
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_sock.setblocking(False)   # never block the main loop waiting for network
+    def _match_to_memory(self, line_xs: list, cx_img: int):
+        """
+        Match detected lines to remembered lane positions.
 
-    # ── Graceful shutdown handler 
-    # Catches Ctrl+C and SIGTERM; sends 3 stop commands for reliability.
-    def _shutdown(sig=None, frame=None):
-        print("\n[main] Shutdown signal — sending STOP to ESP32 …")
-        stop_event.set()
-        for _ in range(3):           # triple-send for reliability on lossy UDP
-            _send_udp(udp_sock, esp_addr, "0,0\n")
-            time.sleep(0.05)
-        udp_sock.close()
-        cv2.destroyAllWindows()
-        print("[main] Clean exit. ✓")
-        sys.exit(0)
+        For each remembered position (left/right), find the closest detected
+        line within LINE_JUMP_THRESH. If a line is too far from where we
+        last saw it, it's a different line (e.g., the outer road boundary)
+        and is ignored.
 
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
+        Falls back to _pick_initial_pair if no memory exists.
+        """
+        # No memory yet — use initial pair selection
+        if self._last_left_x is None and self._last_right_x is None:
+            return self._pick_initial_pair(line_xs, cx_img)
 
-    # ── Camera + Heartbeat threads 
-    frame_queue = queue.Queue(maxsize=2)
+        left_x = None
+        right_x = None
+        used = set()  # indices already assigned
 
-    t_cam = threading.Thread(
-        target=camera_thread,
-        args=(frame_queue, stop_event),
-        daemon=True,
-    )
-    t_hb = threading.Thread(
-        target=heartbeat_thread,
-        args=(udp_sock, esp_addr, stop_event),
-        daemon=True,
-    )
-    t_cam.start()
-    t_hb.start()
-    print("[main] Camera + heartbeat threads started — waiting for first frame …\n")
+        # Match to remembered LEFT position
+        if self._last_left_x is not None:
+            best_dist = self.LINE_JUMP_THRESH
+            best_idx = -1
+            for idx, lx in enumerate(line_xs):
+                dist = abs(lx - self._last_left_x)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            if best_idx >= 0:
+                left_x = line_xs[best_idx]
+                used.add(best_idx)
 
-    # ── Main loop state 
-    last_cmd_time = 0.0
-    cmd_interval = 1.0 / COMMAND_HZ
-    frame_count = 0
-    left_pwm = 0
-    right_pwm = 0
+        # Match to remembered RIGHT position (skip already-used)
+        if self._last_right_x is not None:
+            best_dist = self.LINE_JUMP_THRESH
+            best_idx = -1
+            for idx, lx in enumerate(line_xs):
+                if idx in used:
+                    continue
+                dist = abs(lx - self._last_right_x)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            if best_idx >= 0:
+                right_x = line_xs[best_idx]
 
-    while not stop_event.is_set():
+        return left_x, right_x
 
-        # ── Frame acquisition 
+    def _update_lane_memory(self, left_x, right_x):
+        """
+        Update the EMA-smoothed lane memory with new detections.
+        """
+        alpha = 0.7  # 70% new value, 30% old
+
+        if left_x is not None:
+            if self._last_left_x is None:
+                self._last_left_x = left_x
+            else:
+                self._last_left_x = int(alpha * left_x + (1 - alpha) * self._last_left_x)
+
+        if right_x is not None:
+            if self._last_right_x is None:
+                self._last_right_x = right_x
+            else:
+                self._last_right_x = int(alpha * right_x + (1 - alpha) * self._last_right_x)
+
+    def _run_lane_stage(self, frame_bgr, display, h: int, w: int):
+        """
+        Nearest-pair lane detection with camera offset and lane memory.
+
+        Returns:
+            steering_angle (float|None) — PID output in degrees, or None if
+                                          both lanes are lost.
+        """
         try:
-            frame = frame_queue.get(timeout=CAMERA_TIMEOUT_S)
-        except queue.Empty:
-            print("[main] ⚠ No frame for {:.1f}s — camera down? Sending stop.".format(CAMERA_TIMEOUT_S))
-            _send_udp(udp_sock, esp_addr, "0,0\n")
-            continue
+            # 0. Startup skip
+            self._frame_count += 1
+            if self._frame_count <= self._startup_skip_frames:
+                return None
 
-        t0 = time.perf_counter()
+            # 1. Crop the ROI
+            roi_y = int(h * self.ROI_TOP_FRACTION)
+            roi = frame_bgr[roi_y:h, :]
+            roi_h, roi_w = roi.shape[:2]
 
-        # ── AI inference 
-        # Returns: annotated display frame, steering angle, stop flag, detections dict
-        display, steering, stop_detected, detections = ai_brain.process_frame(frame)
-        ai_ms = (time.perf_counter() - t0) * 1000
+            # 2. Camera offset: shift "straight ahead" reference
+            #    Camera is LEFT of car centre → car centre is RIGHT in image
+            cx_img = roi_w // 2 + self.CAMERA_OFFSET_PX
+            cx_img = max(0, min(roi_w - 1, cx_img))  # safety clamp
 
-        if display is None:
-            continue
+            # 3. Build the white mask
+            mask = self._build_white_mask(roi)
 
-        # ── State machine → motor command 
-        left_pwm, right_pwm = state_machine.update(stop_detected, steering, detections)
+            # 4. Draw ROI line and camera offset marker
+            cv2.line(display, (0, roi_y), (w, roi_y), (100, 0, 200), 1)
+            # Show where the car centre is (after offset) — cyan tick mark
+            vis_y = roi_y + roi_h // 2
+            cv2.line(display, (cx_img, vis_y - 12), (cx_img, vis_y + 12), (255, 255, 0), 2)
 
-        # ── Rate-limited UDP send 
-        now = time.perf_counter()
-        if now - last_cmd_time >= cmd_interval:
-            last_cmd_time = now
-            _send_udp(udp_sock, esp_addr, f"{left_pwm},{right_pwm}\n")
+            # 5. Find ALL white line positions in the full mask
+            line_xs = self._find_all_line_positions(mask)
 
-            # ── Developer console log (every 10th command) 
-            frame_count += 1
-            if frame_count % 10 == 0:
-                state_str = state_machine.state
-                steer_str = f"{steering:+.1f}°" if steering is not None else "N/A"
-                speed_info = f"SPD:{state_machine.active_base_speed}"
-                zone_info = ""
-                if detections.get('speed_limit'):
-                    zone_info = f"  ZONE:{detections['speed_limit']}"
-                if detections.get('person_close'):
-                    zone_info += "  ⚠PERSON"
-                if detections.get('red_light'):
-                    zone_info += "  🔴LIGHT"
+            if not line_xs:
+                self.pid.reset()
+                cv2.putText(
+                    display, "NO LANES DETECTED",
+                    (20, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3
+                )
+                return None
 
-                print(
-                    f"[{state_str:<8}]  L:{left_pwm:+4d}  R:{right_pwm:+4d}"
-                    f"  steer:{steer_str:>8}  {speed_info}"
-                    f"  AI:{ai_ms:5.1f}ms  FPS:{perf.fps:4.1f}{zone_info}"
+            # 6. Match to lane memory (or pick initial pair on first frame)
+            left_x, right_x = self._match_to_memory(line_xs, cx_img)
+
+            # 7. Determine lane centre (target_x)
+            half_lane = self._lane_width // 2
+
+            if left_x is not None and right_x is not None:
+                # ── BOTH lines visible → best case ───────────────────────────
+                target_x = (left_x + right_x) // 2
+
+                # Auto-calibrate lane width
+                measured_w = right_x - left_x
+                if self.LANE_WIDTH_MIN < measured_w < self.LANE_WIDTH_MAX:
+                    self._lane_width = int(0.85 * self._lane_width + 0.15 * measured_w)
+
+                # Visual markers
+                cv2.circle(display, (left_x, vis_y), 6, (255, 0, 0), -1)       # blue = left
+                cv2.circle(display, (right_x, vis_y), 6, (255, 0, 255), -1)    # magenta = right
+                cv2.circle(display, (target_x, vis_y), 6, (0, 255, 255), -1)   # yellow = centre
+                cv2.line(display, (left_x, vis_y), (right_x, vis_y), (0, 255, 0), 1)
+
+            elif left_x is not None:
+                # ── Only LEFT line visible ────────────────────────────────────
+                target_x = left_x + half_lane
+                cv2.circle(display, (left_x, vis_y), 6, (0, 165, 255), -1)
+                cv2.circle(display, (target_x, vis_y), 4, (0, 200, 200), -1)
+                cv2.putText(display, "LEFT ONLY",
+                    (10, roi_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+
+            elif right_x is not None:
+                # ── Only RIGHT line visible ───────────────────────────────────
+                target_x = right_x - half_lane
+                cv2.circle(display, (right_x, vis_y), 6, (0, 165, 255), -1)
+                cv2.circle(display, (target_x, vis_y), 4, (0, 200, 200), -1)
+                cv2.putText(display, "RIGHT ONLY",
+                    (10, roi_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+
+            else:
+                # ── Both lines lost (shouldn't happen if line_xs is non-empty)
+                self.pid.reset()
+                return None
+
+            # 8. Update lane memory
+            self._update_lane_memory(left_x, right_x)
+
+            # 9. Compute steering error (relative to car centre, not image centre)
+            error = target_x - cx_img
+
+            # 10. Deadband
+            if abs(error) < self.STEERING_DEADBAND_PX:
+                error = 0
+
+            # 11. PID → steering angle
+            steering_angle = self.pid.update(error)
+
+            # 12. EMA Smoothing
+            if self._frame_count <= self._startup_skip_frames + 1:
+                self._steer_ema = steering_angle
+            else:
+                self._steer_ema = (
+                    self._steer_ema_alpha * steering_angle
+                    + (1.0 - self._steer_ema_alpha) * self._steer_ema
+                )
+            steering_angle = self._steer_ema
+
+            # ── HUD ───────────────────────────────────────────────────────────
+            cv2.putText(
+                display, f"LW:{self._lane_width}px  err:{error:+d}px  lines:{len(line_xs)}",
+                (w - 280, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 0), 1
+            )
+            # Camera offset indicator
+            if self.CAMERA_OFFSET_PX != 0:
+                cv2.putText(
+                    display, f"CAM:{self.CAMERA_OFFSET_PX:+d}px",
+                    (w - 280, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1
+                )
+            # Error arrow
+            if target_x != cx_img:
+                cv2.arrowedLine(
+                    display, (cx_img, vis_y), (target_x, vis_y),
+                    (0, 255, 0), 2, tipLength=0.3
                 )
 
-        # ── Dashboard overlay 
-        perf.tick(ai_ms)
-        _draw_hud(display, state_machine, left_pwm, right_pwm, steering, ai_ms, perf.fps)
+            return steering_angle
 
-        cv2.imshow("Zenity ROV — v7.0", display)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord("q"):
-            print("[main] 'q' pressed — shutting down")
-            break
-        elif key == ord(" "):
-            # Manual emergency stop: press SPACE to immediately halt
-            print("[main] ⚠ Manual E-STOP (SPACE key)")
-            _send_udp(udp_sock, esp_addr, "0,0\n")
-
-    _shutdown()
-
-if __name__ == "__main__":
-    main()
+        except Exception as exc:
+            print(f"[ZenityBrain] Lane detection error: {exc}")
+            self.pid.reset()
+            return None
